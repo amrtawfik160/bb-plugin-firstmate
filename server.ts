@@ -71,7 +71,7 @@ import { boundedCaptainStartup, captainBindingText } from "./lib/captain-startup
 import { createQueueStore, startOrder, type QueueItem } from "./lib/queue-store.ts";
 import { admissionDecision, createDispatchJobs, dispatchJobLine, spawnBackoffMs } from "./lib/async-dispatch.ts";
 import { createWatchdogStore, observeIdleTurn, tripWatchdog, watchdogNoticeText, watchdogTrip } from "./lib/crew-watchdog.ts";
-import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
+import { captainResumeDelay, FAILOVER_WINDOW_MS, failoverTarget, SHIP_EXCLUDED_PROVIDERS, planLimitError, planLimitNotice, PROVIDER_UNAVAILABLE_KEY, providerExhausted, unavailableProviderLines, unavailableUntil, utcMinute, type ExecutionChoice, type FailedTurnInfo, type UnavailableProviders } from "./lib/provider-failover.ts";
 import { finishedCrewCandidates, isFinishedCrewWake, parseWakeRow, quietStaleVerdict, staleQueueRows, withoutFinishedCrewWakes, type FinishedCrews, type QuietVerdict } from "./lib/finished-crew-wakes.ts";
 import { finishedRetireVerdict, openCaptainHoldOrigins, UNSAVED_WORK_SCRIPT, unsavedWorkFindings } from "./lib/finished-crew-retire.ts";
 import { createDoorbellHold, doorbellHoldDecision } from "./lib/doorbell-hold.ts";
@@ -109,7 +109,7 @@ import { createDeliveries, OWNER_ACTOR, ownerWorksHeadTap, fullCommitSha, verifi
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
-import { chooseProfile, formatPickLine, latestBuilderModel, loadCrewDispatch, MODELS_ACTIONS, readBbSubsQuota, runModelsCommand, type ModelsAction } from "./lib/crew-dispatch.ts";
+import { BB_PROVIDERS, chooseProfile, formatPickLine, latestBuilderModel, loadCrewDispatch, MODELS_ACTIONS, readBbSubsQuota, runModelsCommand, type DispatchProfile, type ModelsAction } from "./lib/crew-dispatch.ts";
 import { CODEX_MODEL, CREW_ROLES, crewExecution, modelPermissionRefusal } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach, type Reach } from "./owner/reach.ts";
@@ -5428,6 +5428,12 @@ export default async function plugin(bb: BbPluginApi) {
       await dispatchCrew({ ...input, crewId: reservedId, signal: launchAbort.signal });
       const done = dispatchJobs.get(reservedId);
       if (done) dispatchJobs.save({ ...done, state: "started" });
+      // The tool only answered "Reserved": the model pick and its notices reach the captain now.
+      const picked = dispatchProviderNotes.get(reservedId);
+      if (picked !== undefined) {
+        await deliverToCaptain(job.captainThreadId, `Crew ${reservedId} started.\n${picked}`, reservedId)
+          .catch((notifyError) => bb.log.warn(`async dispatch ${reservedId} pick notice: ${String(notifyError)}`));
+      }
       for (const ref of input.sourceRefs ?? []) {
         const key = parseSourceRef(ref);
         if (key) inboundLedger.markDelegated(key, reservedId, Date.now());
@@ -7165,14 +7171,18 @@ export default async function plugin(bb: BbPluginApi) {
     const task = input.task.trim().slice(0, MAX_TASK);
     if (task === "") throw new Error("Empty task.");
     // Owner decision (19 Oct): a model the owner named wins. Else the rule Firstmate picked from the
-    // home's config/fm-model-rules.json, else that file's role default; quota and the catalog skip candidates.
+    // home's config/fm-model-rules.json, else that file's role default, else a usable provider; quota,
+    // the catalog, a checker's builder model and the permission guard skip candidates in each.
     const ownerNamed = input.providerNamed === true || input.ownerRequestedProvider === true || input.model !== undefined;
     let pickedByDispatch = false;
-    let planLimitMove = false;
     let providerNote: string | undefined;
+    let namedLimit: string | undefined;
     if (ownerNamed) {
       const execution = crewExecution({ role: input.role, providerId: input.providerNamed === true || input.ownerRequestedProvider === true ? input.providerId : undefined, model: input.model, modelPermission: input.modelPermission });
       input = { ...input, providerId: execution.providerId, model: execution.model };
+      // A named model or provider is never moved by plan-limit or failover logic; its limit is said plainly.
+      const mark = (await unavailableProviders().catch((): UnavailableProviders => ({})))[execution.providerId];
+      if (mark !== undefined) namedLimit = `Note: ${execution.providerId} is ${mark.reason} until ${utcMinute(mark.until)}; this crew still runs on it because it was named. Name another model to move it.`;
     } else {
       const loaded = loadCrewDispatch((await settings.get()).fmHome.trim());
       const quota = await readBbSubsQuota();
@@ -7180,13 +7190,15 @@ export default async function plugin(bb: BbPluginApi) {
       const marks: UnavailableProviders = await unavailableProviders().catch(() => ({}));
       const shipGuard = input.shape === "ship" && (await settings.get()).shipAntigravityGuard !== false;
       const host = await resolveHostForProject(input.projectId, input.parentThreadId, input.signal).catch(() => undefined);
+      const routing: HostRouting = host !== undefined ? { hostId: host } : {};
       const owned = input;
-      const pickWith = (planLimits: boolean) => chooseProfile({
+      const limited = new Set<string>();
+      const pick = await chooseProfile({
         config: loaded.config, rule: input.rule, role: input.role, reasoningLevel: input.reasoningLevel, modelPermission: input.modelPermission, avoidModel, quota,
         check: async (profile) => {
           if (shipGuard && profile.harness === GUARDED_SHIP_PROVIDER) return "not used for ship work";
-          const mark = planLimits ? marks[profile.harness] : undefined;
-          if (mark !== undefined) return `${mark.reason} until ${utcMinute(mark.until)}`;
+          const mark = marks[profile.harness];
+          if (mark !== undefined) { limited.add(profile.harness); return `${mark.reason} until ${utcMinute(mark.until)}`; }
           try {
             await validateProviderChoice(profile.harness, profile.model, owned.projectId, owned.parentThreadId, toReasoningLevel(profile.effort), host);
             return null;
@@ -7195,17 +7207,16 @@ export default async function plugin(bb: BbPluginApi) {
             return typeof why === "string" && why !== "unchecked" ? why : null;
           }
         },
+        resolveModel: (profile) => catalogDefaultModel(profile.harness, routing),
+        fallback: () => usableProviderProfiles({ projectId: owned.projectId, parentThreadId: owned.parentThreadId, shape: owned.shape }, routing),
       });
-      // Every listed model refused and one is at its plan limit: that crew moves to the next usable
-      // provider with its own note, as an unnamed dispatch did before model rules.
-      const pick = await pickWith(true).catch(async (error: unknown) => {
-        if (Object.keys(marks).length === 0) throw error;
-        const marked = await pickWith(false).catch(() => { throw error; });
-        planLimitMove = true;
-        return marked;
-      });
+      // The final concrete model is checked once more: a checker never runs its builder's model.
+      if (avoidModel !== undefined && pick.model === avoidModel) throw new Error(`Refusing: the checker would run its builder's model ${avoidModel}. Name another model. Nothing was spawned.`);
       pickedByDispatch = true;
-      providerNote = [pick.line, pick.notice, loaded.brokenNotice].filter((part) => part !== undefined && part !== "").join("\n");
+      const moved = pick.failed !== undefined && pick.failed.length > 0
+        ? [...limited].filter((id) => id !== pick.providerId).map((id) => `Note: ${id} is ${marks[id]!.reason} until ${utcMinute(marks[id]!.until)}; this crew runs on ${pick.providerId}.`)
+        : [];
+      providerNote = [pick.line, ...moved, pick.notice, loaded.brokenNotice].filter((part) => part !== undefined && part !== "").join("\n");
       input = { ...input, providerId: pick.providerId, model: pick.model, reasoningLevel: toReasoningLevel(pick.reasoningLevel) };
     }
     let guardMoved = false;
@@ -7214,17 +7225,18 @@ export default async function plugin(bb: BbPluginApi) {
       const fallback = (await settings.get()).defaultProvider;
       input = { ...input, providerId: fallback !== "" && fallback !== GUARDED_SHIP_PROVIDER ? fallback : undefined, model: undefined, providerNamed: false };
     }
-    const providerNamed = input.providerNamed === true || input.ownerRequestedProvider === true;
-    if (!providerNamed && (!pickedByDispatch || planLimitMove)) {
+    // Only a crew the ship guard moved off a provider nobody asked for may skip a provider at its plan limit.
+    if (guardMoved) {
       const skip = await skipUnavailableProvider(input).catch((error) => { bb.log.warn(`provider availability check: ${String(error)}`); return null; });
       if (skip !== null) {
         input = { ...input, providerId: skip.providerId, model: skip.model ?? undefined, reasoningLevel: skip.reasoningLevel ?? input.reasoningLevel };
         providerNote = skip.note;
       }
     }
-    // The ship guard and a plan-limit skip explain their own move; otherwise name the owner's pick.
-    if (ownerNamed && providerNote === undefined && !guardMoved) {
-      providerNote = formatPickLine({ providerId: input.providerId, model: input.model, reasoningLevel: input.reasoningLevel, source: "named" });
+    // A named model is the owner's choice: the crew record keeps it from later automatic failover.
+    const providerNamed = input.providerNamed === true || input.ownerRequestedProvider === true || (ownerNamed && !guardMoved);
+    if (ownerNamed && !guardMoved) {
+      providerNote = [formatPickLine({ providerId: input.providerId, model: input.model, reasoningLevel: input.reasoningLevel, source: "named" }), namedLimit].filter((part) => part !== undefined).join("\n");
     }
     await requireProviderSignedIn(input.providerId, input.projectId, input.parentThreadId);
     await drainBeforeAction(input.parentThreadId, "dispatch");
@@ -18641,6 +18653,49 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     await notifyCaptain(next, "failed over", `${failed ?? "provider"} was out of capacity. Relaunched on ${target.providerId}${target.model ? `/${target.model}` : ""} in the same worktree; it re-verifies the work in progress first.`);
+  }
+
+  type HostRouting = { hostId: string } | { hostId?: undefined };
+  // The model a profile without one runs: Codex runs gpt-6.1-sol (owner rule), any other provider its catalog default.
+  async function catalogDefaultModel(providerId: string, routing: HostRouting): Promise<string | undefined> {
+    if (providerId === "codex") return CODEX_MODEL;
+    try {
+      const models = asRecord(await raceAbort(bb.sdk.providers.models({ ...routing, providerId }), undefined, STUCK_HOST_CALL_MS))["models"];
+      const entries = Array.isArray(models) ? models.map(asRecord) : [];
+      const pick = entries.find((m) => m["isDefault"] === true) ?? entries[0];
+      const id = pick?.["model"] ?? pick?.["id"];
+      return typeof id === "string" && id !== "" ? id : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Usable providers for an unnamed crew whose rule and role default cannot run, in failover order:
+  // the defaultProvider setting, the captain's, the project's, then the catalog. Each is checked again.
+  async function usableProviderProfiles(crew: { projectId: string; parentThreadId?: string; shape: Shape }, routing: HostRouting): Promise<DispatchProfile[]> {
+    const preferred: ExecutionChoice[] = [];
+    const configured = (await settings.get()).defaultProvider;
+    if (configured !== "") preferred.push({ providerId: configured, model: null });
+    if (crew.parentThreadId) {
+      try {
+        const captain = await bb.sdk.threads.get({ threadId: crew.parentThreadId });
+        const options = asRecord(await bb.sdk.threads.defaultExecutionOptions({ threadId: crew.parentThreadId }));
+        preferred.push({ providerId: captain.providerId ?? null, model: typeof options["model"] === "string" ? options["model"] : null });
+      } catch { /* the project default and catalog remain */ }
+    }
+    try {
+      const project = asRecord(await bb.sdk.projects.defaultExecutionOptions({ projectId: crew.projectId }));
+      preferred.push({ providerId: typeof project["providerId"] === "string" ? project["providerId"] : null, model: typeof project["model"] === "string" ? project["model"] : null });
+    } catch { /* the catalog remains */ }
+    let rows: Record<string, unknown>[] = [];
+    try { rows = (await raceAbort(bb.sdk.providers.list(routing), undefined, STUCK_HOST_CALL_MS)).map(asRecord); } catch { /* the preferred choices remain */ }
+    const usable = new Set(rows.filter((p) => p["available"] !== false).flatMap((p) => typeof p["id"] === "string" ? [p["id"]] : []));
+    const known = new Set<string>(BB_PROVIDERS);
+    return [...preferred, ...[...usable].map((providerId) => ({ providerId, model: null }))].flatMap((choice) => {
+      const id = choice.providerId;
+      if (!id || !known.has(id) || (rows.length > 0 && !usable.has(id)) || (crew.shape === "ship" && SHIP_EXCLUDED_PROVIDERS.has(id))) return [];
+      return [{ harness: id as DispatchProfile["harness"], ...(choice.model ? { model: choice.model } : {}) }];
+    });
   }
 
   async function failoverExecution(crew: Pick<Crew, "projectId" | "parentThreadId" | "shape" | "reasoningLevel" | "threadId">, failed: string | null): Promise<{ providerId: string; model: string | null; reasoningLevel: ReasoningLevel | undefined } | null> {

@@ -244,7 +244,7 @@ export function findRule(config: CrewDispatchFile, rule: string | undefined): Di
   return config.rules.find((row) => (row.id !== undefined && keyOf(row.id) === key) || keyOf(row.when) === key);
 }
 
-export type PickSource = "named" | "rule" | "default" | "lookup";
+export type PickSource = "named" | "rule" | "default" | "lookup" | "fallback";
 export type PickResult = {
   providerId: string;
   model?: string;
@@ -255,21 +255,45 @@ export type PickResult = {
   line: string;
   /** A plain notice; a line starting "Tell the owner:" must reach the owner. */
   notice?: string;
+  /** The lists that could not run before this pick, with each model's reason. */
+  failed?: Array<{ label: string; reasons: string[] }>;
+  /** Models of the picked list skipped before the pick, with each reason. */
+  skipped?: string[];
 };
 
 /** Concrete evidence that blocks one candidate (catalog refusal, plan limit, ship guard), or null. */
 export type CandidateCheck = (profile: DispatchProfile) => Promise<string | null>;
+/** The model a profile without one runs (the provider's catalog default), or undefined when unknown. */
+export type ModelResolver = (profile: DispatchProfile) => Promise<string | undefined>;
+
+/** No model in a list can run; a caller may try the next list. Permission refusals are plain errors. */
+export class NoUsableModel extends Error {
+  readonly label: string;
+  readonly reasons: string[];
+  constructor(label: string, reasons: string[]) {
+    super(`no model in ${label} can run (${reasons.join("; ")})`);
+    this.label = label;
+    this.reasons = reasons;
+  }
+}
 
 export function profileLine(profile: { harness?: string; providerId?: string; model?: string; effort?: string; reasoningLevel?: string }): string {
   return [profile.harness ?? profile.providerId, profile.model, profile.effort ?? profile.reasoningLevel].filter((part) => part !== undefined && part !== "").join(" ");
 }
 
-export function formatPickLine(pick: { providerId?: string; model?: string; reasoningLevel?: string; source: PickSource; ruleId?: string }, skipped: string[] = []): string {
-  const why = pick.source === "named" ? "owner-named"
-    : pick.source === "lookup" ? "lookup default"
-    : pick.source === "rule" ? `rule ${pick.ruleId}`
-    : "default";
-  return `Picked ${profileLine(pick)} (${why}${skipped.length > 0 ? `; skipped ${skipped.join("; ")}` : ""}).`;
+const sourceText = (source: PickSource, ruleId?: string) => source === "named" ? "owner-named"
+  : source === "lookup" ? "lookup default"
+  : source === "rule" ? `rule ${ruleId}`
+  : source === "fallback" ? "fallback to a usable provider"
+  : "default";
+
+export function formatPickLine(pick: { providerId?: string; model?: string; reasoningLevel?: string; source: PickSource; ruleId?: string; failed?: Array<{ label: string; reasons: string[] }> }, skipped: string[] = []): string {
+  const parts = [
+    sourceText(pick.source, pick.ruleId),
+    ...(pick.failed ?? []).map((row) => `${row.label} cannot run: ${row.reasons.join(", ")}`),
+    ...(skipped.length > 0 ? [`skipped ${skipped.join("; ")}`] : []),
+  ];
+  return `Picked ${profileLine(pick)} (${parts.join("; ")}).`;
 }
 
 function percentOf(limit: QuotaLimit): number | undefined {
@@ -287,72 +311,100 @@ function rowApplies(limit: QuotaLimit, model: string | undefined): boolean {
   return group !== "" && model !== undefined && keyOf(model).includes(group);
 }
 
-function accountPercent(account: QuotaAccount, model: string | undefined): number | undefined {
+export type QuotaLeft = { percent: number; window: string };
+
+// The weekly rows decide; with no weekly row, the tightest other window stands in under its own label.
+function accountLeft(account: QuotaAccount, model: string | undefined): QuotaLeft | undefined {
   const rows = account.limits.filter((row) => rowApplies(row, model));
   const weekly = rows.filter((row) => /week/i.test(row.label ?? ""));
-  const percents = (weekly.length > 0 ? weekly : rows).map(percentOf).filter((n): n is number => n !== undefined);
-  return percents.length === 0 ? undefined : Math.min(...percents);
+  let tightest: QuotaLeft | undefined;
+  for (const row of weekly.length > 0 ? weekly : rows) {
+    const percent = percentOf(row);
+    if (percent !== undefined && (tightest === undefined || percent < tightest.percent)) tightest = { percent, window: row.label?.trim() || "quota" };
+  }
+  return tightest;
 }
 
-/** Weekly quota left (percent) for a profile, from the active account; undefined when unknown. */
-export function weeklyPercent(snapshot: QuotaSnapshot | null | undefined, harness: string, model?: string): number | undefined {
+/** Quota left for a profile on its best active account, with the window it was read from; undefined when unknown. */
+export function quotaLeft(snapshot: QuotaSnapshot | null | undefined, harness: string, model?: string): QuotaLeft | undefined {
   const provider = QUOTA_PROVIDER[harness as BbProvider];
   if (snapshot == null || provider === undefined) return undefined;
   const accounts = snapshot.accounts.filter((row) => row.provider === provider && row.stale !== true && row.error == null);
   const active = accounts.filter((row) => row.active === true);
-  let best: number | undefined;
+  let best: QuotaLeft | undefined;
   for (const account of active.length > 0 ? active : accounts) {
-    const pct = accountPercent(account, model);
-    if (pct !== undefined && (best === undefined || pct > best)) best = pct;
+    const left = accountLeft(account, model);
+    if (left !== undefined && (best === undefined || left.percent > best.percent)) best = left;
   }
   return best;
 }
 
-const pctText = (pct: number) => `${Math.floor(pct)}% weekly left`;
+/** Weekly quota left (percent), or undefined when no weekly row applies. */
+export function weeklyPercent(snapshot: QuotaSnapshot | null | undefined, harness: string, model?: string): number | undefined {
+  const left = quotaLeft(snapshot, harness, model);
+  return left !== undefined && /week/i.test(left.window) ? left.percent : undefined;
+}
 
-async function pickFromProfiles(listed: DispatchProfile[], input: {
+const leftText = (left: QuotaLeft) => `${Math.floor(left.percent)}% left in ${left.window.toLowerCase()}`;
+
+type ListInput = {
   label: string; source: PickSource; ruleId?: string;
-  quota?: QuotaSnapshot | null; modelPermission?: string; avoidModel?: string; check?: CandidateCheck; effort?: string;
-}): Promise<PickResult> {
-  const profiles = input.effort === undefined ? listed : listed.map((profile) => ({ ...profile, effort: input.effort }));
-  const differs = profiles.filter((profile) => input.avoidModel === undefined || profile.model !== input.avoidModel);
-  if (differs.length === 0) throw new Error(`Refusing: the checker model must differ from the builder model (${input.avoidModel}), and ${input.label} lists no other. Nothing was spawned.`);
-  const permitted = differs.filter((profile) => profile.model === undefined || !PERMISSION_MODELS.has(profile.model) || modelPermissionRefusal(profile.model, input.modelPermission) === null);
-  if (permitted.length === 0) throw new Error(modelPermissionRefusal(differs[0]!.model, input.modelPermission)!);
+  quota?: QuotaSnapshot | null; modelPermission?: string; avoidModel?: string; check?: CandidateCheck; resolveModel?: ModelResolver; effort?: string;
+  /** Concrete models an earlier list already tried; they are not tried again. */
+  seen: Set<string>;
+};
+
+async function pickFromProfiles(listed: DispatchProfile[], input: ListInput): Promise<PickResult> {
   const skipped: string[] = [];
+  const reasons: string[] = [];
+  const permissionRefusals: string[] = [];
+  const low: Array<{ profile: DispatchProfile; left: QuotaLeft; at: number }> = [];
   const blocks = new Map<DispatchProfile, string | null>();
   const blocked = async (profile: DispatchProfile): Promise<string | null> => {
     if (!blocks.has(profile)) blocks.set(profile, input.check === undefined ? null : await input.check(profile));
     return blocks.get(profile)!;
   };
+  const skip = (profile: DispatchProfile, why: string) => { skipped.push(`${profileLine(profile)}: ${why}`); reasons.push(`${profileLine(profile)}: ${why}`); };
   const done = (profile: DispatchProfile, notice?: string): PickResult => {
     const pick = { providerId: profile.harness, model: profile.model, reasoningLevel: toReasoningLevel(profile.effort), source: input.source, ruleId: input.ruleId };
-    return { ...pick, line: formatPickLine(pick, skipped), ...(notice !== undefined ? { notice } : {}) };
+    return { ...pick, line: formatPickLine(pick, skipped), ...(skipped.length > 0 ? { skipped: [...skipped] } : {}), ...(notice !== undefined ? { notice } : {}) };
   };
-  const low: Array<{ profile: DispatchProfile; pct: number }> = [];
-  for (const profile of permitted) {
-    const pct = weeklyPercent(input.quota, profile.harness, profile.model);
-    if (pct !== undefined && pct <= 0) { skipped.push(`${profileLine(profile)}: out of weekly quota`); continue; }
-    if (pct !== undefined && pct < LOW_QUOTA_PERCENT) { low.push({ profile, pct }); skipped.push(`${profileLine(profile)}: ${pctText(pct)}`); continue; }
+  let candidates = 0;
+  for (const raw of listed) {
+    // A profile without a model runs its provider's default, so the exclusions below see that model.
+    const model = raw.model ?? await input.resolveModel?.(raw);
+    const profile: DispatchProfile = { ...raw, ...(model !== undefined ? { model } : {}), ...(input.effort !== undefined ? { effort: input.effort } : {}) };
+    const key = `${profile.harness} ${profile.model ?? ""}`;
+    if (input.seen.has(key)) continue;
+    input.seen.add(key);
+    candidates += 1;
+    if (input.avoidModel !== undefined && profile.model === input.avoidModel) { skip(profile, "the builder's model"); continue; }
+    const refusal = modelPermissionRefusal(profile.model, input.modelPermission);
+    if (profile.model !== undefined && PERMISSION_MODELS.has(profile.model) && refusal !== null) { permissionRefusals.push(refusal); skip(profile, "needs the owner's permission"); continue; }
+    const left = quotaLeft(input.quota, profile.harness, profile.model);
+    if (left !== undefined && left.percent <= 0) { skip(profile, `none left in ${left.window.toLowerCase()}`); continue; }
+    if (left !== undefined && left.percent < LOW_QUOTA_PERCENT) { low.push({ profile, left, at: skipped.length }); skip(profile, leftText(left)); continue; }
     const why = await blocked(profile);
-    if (why !== null) { skipped.push(`${profileLine(profile)}: ${why}`); continue; }
-    const unread = input.quota === null && permitted.length > 1 ? `Quota could not be read; kept the first model in ${input.label} that the catalog accepts.` : undefined;
+    if (why !== null) { skip(profile, why); continue; }
+    const unread = input.quota === null && listed.length > 1 ? `Quota could not be read; kept the first model in ${input.label} that the catalog accepts.` : undefined;
     return done(profile, unread);
   }
   // Every candidate is low: keep the strongest one that can run, never a silent downgrade.
-  for (const { profile, pct } of low) {
-    const at = skipped.indexOf(`${profileLine(profile)}: ${pctText(pct)}`);
+  for (const { profile, left, at } of low) {
     const why = await blocked(profile);
-    if (why !== null) { skipped[at] = `${profileLine(profile)}: ${pctText(pct)}, ${why}`; continue; }
+    if (why !== null) { skipped[at] = `${profileLine(profile)}: ${leftText(left)}, ${why}`; reasons[at] = skipped[at]!; continue; }
     skipped.splice(at, 1);
-    return done(profile, `Tell the owner: every model in ${input.label} that can run is under ${LOW_QUOTA_PERCENT}% weekly quota; kept ${profileLine(profile)} (${pctText(pct)}).`);
+    return done(profile, `Tell the owner: every model in ${input.label} that can run is under ${LOW_QUOTA_PERCENT}% quota; kept ${profileLine(profile)} (${leftText(left)}).`);
   }
-  throw new Error(`Refusing: no model in ${input.label} can run (${skipped.join("; ")}). Name a model or pick another rule. Nothing was spawned.`);
+  // Only the permission guard stopped this list: say so plainly instead of choosing around it.
+  if (candidates > 0 && permissionRefusals.length === candidates) throw new Error(permissionRefusals[0]!);
+  throw new NoUsableModel(input.label, reasons);
 }
 
 /**
  * Order: owner-named model > the rule Firstmate picked > the role default in the file (checker rule for a
- * checker). Quota skips a profile under 15% weekly; `check` skips a profile the catalog or a guard refuses.
+ * checker) > a usable provider from `fallback`. Each list skips a model under 15% quota, one `check`
+ * refuses, a checker's builder model, and gpt-6-astra without the owner's permission.
  */
 export async function chooseProfile(input: {
   config: CrewDispatchFile;
@@ -365,6 +417,9 @@ export async function chooseProfile(input: {
   avoidModel?: string;
   quota?: QuotaSnapshot | null;
   check?: CandidateCheck;
+  resolveModel?: ModelResolver;
+  /** Usable providers, best first, tried when the rule and the role default cannot run. */
+  fallback?: () => Promise<DispatchProfile[]>;
 }): Promise<PickResult> {
   const named = input.named;
   if (named != null && (named.providerId !== undefined || named.model !== undefined)) {
@@ -374,26 +429,46 @@ export async function chooseProfile(input: {
     const pick = { providerId: named.providerId ?? role.providerId, model: named.model, reasoningLevel: named.reasoningLevel, source: "named" as const };
     return { ...pick, line: formatPickLine(pick) };
   }
-  const shared = { quota: input.quota, modelPermission: input.modelPermission, avoidModel: input.avoidModel, check: input.check, effort: input.reasoningLevel };
+  const seen = new Set<string>();
+  const shared = { quota: input.quota, modelPermission: input.modelPermission, avoidModel: input.avoidModel, check: input.check, resolveModel: input.resolveModel, effort: input.reasoningLevel, seen };
   const matched = findRule(input.config, input.rule);
-  const unknown = input.rule !== undefined && keyOf(input.rule) !== "" && matched === undefined
-    ? `Unknown rule "${input.rule.trim()}"; used the ${input.role ?? "builder"} default. Rules: ${input.config.rules.map((row) => row.id ?? row.when).join(", ")}.`
-    : undefined;
-  const withUnknown = (pick: PickResult): PickResult => unknown === undefined ? pick : { ...pick, notice: [unknown, pick.notice].filter(Boolean).join("\n") };
-  if (matched !== undefined) {
-    const id = matched.id ?? matched.when;
-    return pickFromProfiles(matched.use, { ...shared, label: `rule ${id}`, source: "rule", ruleId: id });
+  const notices: string[] = [];
+  if (input.rule !== undefined && keyOf(input.rule) !== "" && matched === undefined) {
+    notices.push(`Unknown rule "${input.rule.trim()}"; used the ${input.role ?? "builder"} default. Rules: ${input.config.rules.map((row) => row.id ?? row.when).join(", ")}.`);
   }
-  if (input.role === "checker") {
-    const checker = findRule(input.config, "checker") ?? findRule(STARTER_DISPATCH, "checker")!;
-    const id = checker.id ?? checker.when;
-    return withUnknown(await pickFromProfiles(checker.use, { ...shared, label: `rule ${id}`, source: "rule", ruleId: id }));
-  }
-  if (input.role === "lookup") {
+  const checker = input.role === "checker" ? findRule(input.config, "checker") ?? findRule(STARTER_DISPATCH, "checker")! : undefined;
+  const lists: Array<{ use: () => Promise<DispatchProfile[]>; label: string; source: PickSource; ruleId?: string }> = [];
+  if (matched !== undefined) lists.push({ use: async () => matched.use, label: `rule ${matched.id ?? matched.when}`, source: "rule", ruleId: matched.id ?? matched.when });
+  if (checker !== undefined && checker !== matched) lists.push({ use: async () => checker.use, label: `rule ${checker.id ?? checker.when}`, source: "rule", ruleId: checker.id ?? checker.when });
+  else if (input.role === "lookup") {
     const lookup = ROLE_DEFAULTS.lookup;
-    return withUnknown(await pickFromProfiles([{ harness: lookup.providerId as BbProvider, model: lookup.model }], { ...shared, label: "the lookup default", source: "lookup" }));
+    lists.push({ use: async () => [{ harness: lookup.providerId as BbProvider, model: lookup.model }], label: "the lookup default", source: "lookup" });
+  } else if (checker === undefined) lists.push({ use: async () => input.config.default, label: "the default", source: "default" });
+  if (input.fallback !== undefined) lists.push({ use: input.fallback, label: "the usable providers", source: "fallback" });
+  const failed: Array<{ label: string; reasons: string[] }> = [];
+  for (const list of lists) {
+    let pick: PickResult;
+    try {
+      pick = await pickFromProfiles(await list.use(), { ...shared, label: list.label, source: list.source, ...(list.ruleId !== undefined ? { ruleId: list.ruleId } : {}) });
+    } catch (error) {
+      if (!(error instanceof NoUsableModel)) throw error;
+      failed.push({ label: error.label, reasons: error.reasons });
+      continue;
+    }
+    if (failed.some((row) => row.reasons.length > 0)) {
+      const stale = failed.some((row) => row.reasons.some((why) => /not in the catalog|unknown provider/.test(why)));
+      pick.failed = failed.filter((row) => row.reasons.length > 0);
+      pick.line = formatPickLine(pick, pick.skipped);
+      notices.push(`Tell the owner: ${pick.failed.map((row) => `${row.label} cannot run (${row.reasons.join("; ")})`).join("; ")}; this crew runs ${profileLine(pick)} instead.${stale ? " Update the rule with firstmate_models." : ""}`);
+    }
+    const all = [...notices, ...(pick.notice !== undefined ? [pick.notice] : [])];
+    if (all.length > 0) pick.notice = all.join("\n");
+    else delete pick.notice;
+    return pick;
   }
-  return withUnknown(await pickFromProfiles(input.config.default, { ...shared, label: "the default", source: "default" }));
+  // A list with nothing left to try (each model already tried above) adds no reason of its own.
+  const parts = failed.map((row) => row.reasons.length > 0 ? `no model in ${row.label} can run (${row.reasons.join("; ")})` : `nothing else to try in ${row.label}`);
+  throw new Error(`Refusing: ${parts.join("; ")}. Name a model or pick another rule. Nothing was spawned.`);
 }
 
 /** The model of the newest builder crew among `crewIds` (the checked task's crews), else under the captain. */

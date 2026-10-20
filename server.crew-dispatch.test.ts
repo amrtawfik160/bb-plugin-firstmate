@@ -76,10 +76,14 @@ test("every pick goes through the catalog: a missing model is skipped, antigravi
     const scout = await dispatch(host, { task: "survey the login form styles", rule: "ui", shape: "scout" });
     assert.match(scout, /Picked acp-antigravity gemini-3\.8-flash \(rule ui; skipped acp-grok grok-4\.5 high: not in the catalog\)\./);
     assert.deepEqual(spawned(host).at(-1), { providerId: "acp-antigravity", model: "gemini-3.8-flash", reasoningLevel: undefined });
-    const before = spawned(host).length;
     host.harness.sdk.stub("providers.list", async () => Object.keys(PROVIDER_CATALOG).map((id) => ({ id, available: id !== "acp-grok", reasoningLevels: [{ id: "high" }] })));
+    const moved = await dispatch(host, { task: "what changed in the API this week", rule: "research" });
+    assert.match(moved, /\nPicked claude-code claude-opus-5-5 \(default; rule research cannot run: acp-grok grok-4\.7: provider not available\)\.\nTell the owner: rule research cannot run \(acp-grok grok-4\.7: provider not available\); this crew runs claude-code claude-opus-5-5 instead\./);
+    assert.deepEqual(spawned(host).at(-1), { providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: undefined });
+    const before = spawned(host).length;
+    host.harness.sdk.stub("providers.list", async () => Object.keys(PROVIDER_CATALOG).map((id) => ({ id, available: false, reasoningLevels: [{ id: "high" }] })));
     const refused = await dispatch(host, { task: "what changed in the API this week", rule: "research" });
-    assert.match(refused, /no model in rule research can run \(acp-grok grok-4\.7: provider not available\)\. Name a model or pick another rule\. Nothing was spawned\./);
+    assert.match(refused, /no model in rule research can run \(acp-grok grok-4\.7: provider not available\); no model in the default can run \(claude-code claude-opus-5-5: provider not available\); nothing else to try in the usable providers\. Name a model or pick another rule\. Nothing was spawned\./);
     assert.equal(spawned(host).length, before, "nothing was spawned");
   } finally { await host.harness.lifecycle.dispose(); }
 });
@@ -114,7 +118,7 @@ test("checker differs: a checker for a task runs another model than that task's 
     const built = await dispatch(host, { task: "fix the invoice total rounding", taskId: "builder-1", providerId: "codex", model: "gpt-6.1-sol" }, capCtx);
     assert.match(built, /Owner task T1 /);
     const checked = await dispatch(host, { task: "check the invoice rounding PR", taskId: "checker-1", role: "checker", shape: "scout", taskRef: "T1" }, capCtx);
-    assert.match(checked, /\nPicked claude-code claude-opus-5-5 \(rule checker\)\./);
+    assert.match(checked, /\nPicked claude-code claude-opus-5-5 \(rule checker; skipped codex gpt-6\.1-sol: the builder's model\)\./);
     assert.deepEqual(spawned(host).at(-1), { providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: undefined });
   } finally { await host.harness.lifecycle.dispose(); }
 });

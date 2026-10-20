@@ -7,6 +7,7 @@ import {
   chooseProfile,
   latestBuilderModel,
   loadCrewDispatch,
+  quotaLeft,
   readBbSubsQuota,
   runModelsCommand,
   weeklyPercent,
@@ -136,10 +137,10 @@ test("quota skip: under 15% weekly or 0% is skipped, 15% is kept, and the line s
   const skipped = await chooseProfile({ config, rule: "ui", quota: quota([{ provider: "grok", weekly: 10 }, { provider: "antigravity", weekly: 80 }, { provider: "claude", weekly: 90 }]) });
   assert.deepEqual([skipped.providerId, skipped.model], ["acp-antigravity", "gemini-3.8-flash"]);
   assert.equal(skipped.notice, undefined);
-  assert.equal(skipped.line, "Picked acp-antigravity gemini-3.8-flash (rule ui; skipped acp-grok grok-4.5 high: 10% weekly left).");
+  assert.equal(skipped.line, "Picked acp-antigravity gemini-3.8-flash (rule ui; skipped acp-grok grok-4.5 high: 10% left in weekly window).");
   const exhausted = await chooseProfile({ config, rule: "ui", quota: quota([{ provider: "grok", weekly: 0 }, { provider: "antigravity", weekly: 40 }]) });
   assert.equal(exhausted.model, "gemini-3.8-flash");
-  assert.match(exhausted.line, /acp-grok grok-4\.5 high: out of weekly quota/);
+  assert.match(exhausted.line, /acp-grok grok-4\.5 high: none left in weekly window/);
   assert.equal((await chooseProfile({ config, rule: "ui", quota: quota([{ provider: "grok", weekly: 15 }]) })).model, "grok-4.5");
   const fiveHourHigh = quota([{ provider: "grok", extra: [
     { label: "5h", remaining: 90, limit: 100, unit: "percent" },
@@ -148,25 +149,30 @@ test("quota skip: under 15% weekly or 0% is skipped, 15% is kept, and the line s
   assert.equal(weeklyPercent(fiveHourHigh, "acp-grok"), 8, "the weekly row decides, not the 5-hour row");
 });
 
-test("quota reads the live bb subs shape: active account, model-group rows, usd plans, stale accounts", () => {
+test("quota reads the live bb subs shape: active account, model-group rows, usd plans, stale accounts", async () => {
   const live = LIVE_SHAPE as unknown as QuotaSnapshot;
-  assert.equal(weeklyPercent(live, "claude-code", "claude-opus-5-5"), 55, "the active account counts; a Fable row does not apply to Opus");
+  assert.equal(weeklyPercent(live, "claude-code", "claude-opus-5-5"), undefined, "the active account has no weekly row for Opus; a Fable row does not apply");
+  assert.deepEqual(quotaLeft(live, "claude-code", "claude-opus-5-5"), { percent: 55, window: "5-hour window" }, "the window that stands in keeps its own label");
   assert.equal(weeklyPercent(live, "claude-code", "claude-fable-5-1"), 5, "a Fable row applies to Fable");
   assert.equal(weeklyPercent(live, "acp-grok", "grok-4.5"), 0);
   assert.equal(weeklyPercent(live, "acp-antigravity", "gemini-3.8-flash"), undefined, "a Claude group row says nothing about Gemini");
   assert.equal(weeklyPercent(live, "acp-antigravity", "claude-opus-5-5"), 0);
   assert.equal(weeklyPercent(live, "codex", "gpt-6.1-sol"), 37, "credits without a limit are not a percent");
-  assert.equal(weeklyPercent(live, "acp-cursor", "composer-2.5"), 2.5);
+  assert.equal(weeklyPercent(live, "acp-cursor", "composer-2.5"), undefined);
+  assert.deepEqual(quotaLeft(live, "acp-cursor", "composer-2.5"), { percent: 2.5, window: "Plan usage" });
   assert.equal(weeklyPercent(live, "pi", "anything"), undefined, "pi spans many providers");
   assert.equal(weeklyPercent(quota([{ provider: "grok", weekly: 1, stale: true }]), "acp-grok"), undefined, "a stale account is unknown");
+  const { config } = loadCrewDispatch("");
+  const fiveHour = await chooseProfile({ config, rule: "big-risky", quota: quota([{ provider: "grok", weekly: 90 }, { provider: "claude", extra: [{ label: "5-hour window", remaining: 6, limit: 100, unit: "percent", scope: null }] }]), check: async (p) => p.harness === "acp-grok" ? "not in the catalog" : null });
+  assert.match(fiveHour.line, /claude-code claude-opus-5-5: 6% left in 5-hour window/, "a 5-hour reading is never called weekly");
 });
 
 test("all-low notice: every model low keeps the strongest that can run and tells the owner", async () => {
   const { config } = loadCrewDispatch("");
   const pick = await chooseProfile({ config, rule: "ui", quota: quota([{ provider: "grok", weekly: 5 }, { provider: "antigravity", weekly: 3 }, { provider: "claude", weekly: 10 }]) });
   assert.deepEqual([pick.providerId, pick.model], ["acp-grok", "grok-4.5"]);
-  assert.equal(pick.notice, "Tell the owner: every model in rule ui that can run is under 15% weekly quota; kept acp-grok grok-4.5 high (5% weekly left).");
-  assert.doesNotMatch(pick.line, /grok-4\.5 high: 5%/, "the kept model is not listed as skipped");
+  assert.equal(pick.notice, "Tell the owner: every model in rule ui that can run is under 15% quota; kept acp-grok grok-4.5 high (5% left in weekly window).");
+  assert.doesNotMatch(pick.line, /grok-4\.5 high: 5% left/, "the kept model is not listed as skipped");
   const firstOut = await chooseProfile({ config, rule: "ui", quota: quota([{ provider: "grok", weekly: 0 }, { provider: "antigravity", weekly: 3 }, { provider: "claude", weekly: 10 }]) });
   assert.equal(firstOut.model, "gemini-3.8-flash", "an exhausted model is skipped even when all are low");
   const lowBlocked = await chooseProfile({
@@ -174,10 +180,10 @@ test("all-low notice: every model low keeps the strongest that can run and tells
     check: async (profile) => profile.harness === "acp-grok" ? "not in the catalog" : null,
   });
   assert.equal(lowBlocked.model, "gemini-3.8-flash");
-  assert.match(lowBlocked.line, /skipped acp-grok grok-4\.5 high: 5% weekly left, not in the catalog; claude-code claude-opus-5-5: 10% weekly left\)/);
+  assert.match(lowBlocked.line, /skipped acp-grok grok-4\.5 high: 5% left in weekly window, not in the catalog; claude-code claude-opus-5-5: 10% left in weekly window\)/);
   await assert.rejects(
     chooseProfile({ config, rule: "ui", quota: quota([{ provider: "grok", weekly: 0 }, { provider: "antigravity", weekly: 0 }, { provider: "claude", weekly: 0 }]) }),
-    /no model in rule ui can run .*out of weekly quota.*Nothing was spawned/,
+    /no model in rule ui can run .*none left in weekly window.*Nothing was spawned/,
   );
 });
 
@@ -202,6 +208,26 @@ test("a candidate the catalog or a guard refuses is skipped and named; all refus
   assert.equal(pick.line, "Picked claude-code claude-opus-5-5 (rule ui; skipped acp-grok grok-4.5 high: not in the catalog; acp-antigravity gemini-3.8-flash: not used for ship work).");
   assert.deepEqual(seen, ["grok-4.5", "gemini-3.8-flash", "claude-opus-5-5"], "each candidate is checked once, in order");
   await assert.rejects(chooseProfile({ config, rule: "research", check: async () => "provider not available" }), /no model in rule research can run \(acp-grok grok-4\.7: provider not available\)/);
+});
+
+test("fallback: a rule that cannot run tries the role default, then usable providers, each checked again", async () => {
+  const { config } = loadCrewDispatch("");
+  const stale = await chooseProfile({ config, rule: "research", check: async (p) => p.model === "grok-4.7" ? "not in the catalog" : null });
+  assert.deepEqual([stale.providerId, stale.model, stale.source], ["claude-code", "claude-opus-5-5", "default"]);
+  assert.equal(stale.line, "Picked claude-code claude-opus-5-5 (default; rule research cannot run: acp-grok grok-4.7: not in the catalog).");
+  assert.equal(stale.notice, "Tell the owner: rule research cannot run (acp-grok grok-4.7: not in the catalog); this crew runs claude-code claude-opus-5-5 instead. Update the rule with firstmate_models.");
+  const resolveModel = async (p: { harness: string }) => p.harness === "codex" ? "gpt-6.1-sol" : p.harness === "acp-grok" ? "grok-4.7" : "claude-opus-5-5";
+  const fallback = async () => [{ harness: "claude-code" as const }, { harness: "codex" as const }, { harness: "acp-grok" as const }];
+  const moved = await chooseProfile({
+    config, role: "builder", avoidModel: "gpt-6.1-sol", resolveModel, fallback,
+    quota: quota([{ provider: "claude", weekly: 0 }, { provider: "codex", weekly: 80 }, { provider: "grok", weekly: 80 }]),
+  });
+  assert.deepEqual([moved.providerId, moved.model, moved.source], ["acp-grok", "grok-4.7", "fallback"], "quota, then the excluded model, are checked again on the fallback");
+  assert.match(moved.line, /^Picked acp-grok grok-4\.7 \(fallback to a usable provider; the default cannot run: claude-code claude-opus-5-5: none left in weekly window; skipped codex gpt-6\.1-sol: the builder's model\)\.$/);
+  assert.doesNotMatch(moved.line, /claude-code claude-opus-5-5: none left in weekly window;.*claude-code claude-opus-5-5/, "a model already tried is not tried again");
+  const onlyAstra = { ...config, rules: [{ id: "only-astra", when: "only astra", use: [{ harness: "codex" as const, model: "gpt-6-astra" }] }] };
+  await assert.rejects(chooseProfile({ config: onlyAstra, rule: "only-astra", fallback }), /gpt-6-astra needs the owner's permission/, "the permission guard is never chosen around");
+  await assert.rejects(chooseProfile({ config, rule: "research", fallback: async () => [], check: async () => "provider not available" }), /^Error: Refusing: no model in rule research can run \(acp-grok grok-4\.7: provider not available\); no model in the default can run/);
 });
 
 test("astra guard: gpt-6-astra is skipped without the owner permission ref and allowed with it", async () => {
@@ -229,7 +255,7 @@ test("checker differs: a checker skips the builder model of the task it checks",
   assert.equal(latestBuilderModel(crews, { parentThreadId: "cap", crewIds: ["b1"] }), "grok-4.6", "the checked task's crews win");
   await assert.rejects(
     chooseProfile({ config: { ...config, rules: [{ id: "checker", when: "checker", use: [{ harness: "codex", model: "gpt-6.1-sol" }] }] }, role: "checker", avoidModel: "gpt-6.1-sol" }),
-    /checker model must differ from the builder model \(gpt-6\.1-sol\)/,
+    /no model in rule checker can run \(codex gpt-6\.1-sol: the builder's model\)\. Name a model or pick another rule\. Nothing was spawned\./,
   );
 });
 
