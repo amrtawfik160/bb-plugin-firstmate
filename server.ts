@@ -1,4 +1,7 @@
 import { affirmative, APPROVAL_CHOICES, approvalCardText, fixedApprovalChoices, compareSchema, createProductionApprovals, onlyBaseMerges, productionMergeGuard, PRODUCTION_APPROVAL_POINTER, PRODUCTION_CARD_RULE } from "./lib/production-approval.ts";
+import { approvalFor, createOwnerGate, gatedAskResolve, ownerDispatchSource, prodCheck, quotePreApproval, type GateCard, type HeadCoverage, type PreApproval, type ProdWhat } from "./lib/owner-gate.ts";
+import { postStatusCommand } from "./lib/github-status.ts";
+import { judgePreApprovalBound } from "./lib/pre-approval-judge.ts";
 // bb-plugin-firstmate — firstmate-style crews native to BB.
 import { deflateSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -83,7 +86,7 @@ import { formatWorkersForTelegram } from "./lib/telegram-commands.ts";
 import { digestOnce, EMPTY_DIGEST_MEMORY, formatBoard, workingByProject, type BoardInput, type DigestMemory } from "./lib/owner-board.ts";
 import { createOwnerPromises, promiseLine, promiseTime, followupPromises } from "./lib/owner-promises.ts";
 import { parseSearchRows, strayPrs } from "./lib/stray-prs.ts";
-import { createOwnerTasks, isFinishedTask, isOpenTask, sameProject, stateFromPrs, taskLine, taskOfRef, telegramTasks, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
+import { createOwnerTasks, isFinishedTask, isOpenTask, sameProject, stateFromPrs, taskLine, taskOfRef, taskOpenEpoch, telegramTasks, type CrewFinish, type OwnerTask, type TaskState } from "./lib/owner-tasks.ts";
 import { easBuildCommit, readEnvFile, type PrDetails } from "./lib/live-checks.ts";
 import { LIVE_PASS_MS, planOf, ruleOf, runLivePass, type LiveStatus } from "./lib/live-pass.ts";
 import { EMPTY_STALL_MEMORY, notLiveItems } from "./lib/stalls.ts";
@@ -91,17 +94,17 @@ import {
   buildProgram, createPrograms, isOpenProgram, isOpenTicket, newlyReady, numberOf, programCounts, programText, readyRefs, readyWakeText, repoOf,
   shortTicket, stallReminderDue, stallReminderText, ticketRef, type IssueFacts, type Program, type ProgramFact, type TicketRef,
 } from "./lib/programs.ts";
-import { askLetterAnswer, askIdFromSourceEventId, packAnswers, choicesFromCrewReport, clip, createOwnerAsks, crewQuestionText, formatAge, formatAskCard, formatUtcTime, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, ASK_FOLLOWUP_GIVE_UP_MS, type AskKind, type AskFollowUp, type OwnerAsk } from "./lib/owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, packAnswers, choicesFromCrewReport, clip, createOwnerAsks, crewQuestionText, formatAge, formatAskCard, formatAskRound, formatUtcTime, isRoundAsk, mayDefault, OWNER_CLOSED_RESOLUTION, CAPTAIN_RULES, OWNER_DECISION_RULE, recommendedLabel, replacedBy, ASK_FOLLOWUP_GIVE_UP_MS, ASK_ROUND_MAX_CHARS, type AskKind, type AskFollowUp, type OwnerAsk } from "./lib/owner-asks.ts";
 import { DEFAULT_RELIABILITY_FLAGS, reliabilityFlagsFromSettings } from "./lib/reliability-flags.ts";
 import { sanitizeSettingValue } from "./lib/settings-schema.ts";
-import { coalesceBatches, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef } from "./lib/telegram-envelope.ts";
+import { coalesceBatches, isBotOrAckText, parseConnectorHeader, parseInboundTelegram, parseSourceRef, parseTelegramSubmission, stripTelegramEnvelope, telegramReplyParameters, telegramSourceRef, type TelegramEnvelope } from "./lib/telegram-envelope.ts";
 import { telegramFileRefusals } from "./lib/telegram-files.ts";
-import { connectorReplied, correlationOf, isTelegramRpcMissing, oldestUnanswered, sendTelegramReply, TELEGRAM_BRIDGE_PLUGIN_ID, telegramReplyFallbackBody } from "./lib/telegram-reply.ts";
-import { createLaunches, launchKey, launchTaskKey, discoverLaunch, type LaunchRecord } from "./lib/launch.ts";
+import { connectorReplied, correlationOf, isTelegramRpcMissing, oldestUnanswered, sendTelegramReply, TELEGRAM_BRIDGE_PLUGIN_ID, TELEGRAM_REPLY_METHOD, telegramReplyFallbackBody, telegramReplyOutputSchema } from "./lib/telegram-reply.ts";
+import { ATTEMPT_TOKEN_ENVIRON_PY, attemptTokenFromAdmissionOutput, createLaunches, launchKey, launchTaskKey, discoverLaunch, discoverLaunchComplete, type LaunchRecord } from "./lib/launch.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
-import { createDeliveries, OWNER_ACTOR, verifiedBy, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
+import { createDeliveries, OWNER_ACTOR, ownerWorksHeadTap, fullCommitSha, verifiedBy, LOST_OWNER_RECHECK_MS, canonicalPr, decisionLine, deliveryLine, parseForge, PR_VIEW_FIELDS, PR_VIEW_JQ, prBranchOwner, releasesTask, type DeliveryRecord, type PrBranchCandidate } from "./lib/pr-delivery.ts";
 import { captureHostCommand, decodeHostCapture } from "./lib/host-capture.ts";
 import { selectExecution, validateLaunchCapabilities } from "./lib/execution-selection.ts";
 import { crewPipeline, crewPlaybook, crewSkillBlock, crewSkillRoot, notVerifiedNote, notVerifiedRequest, pipelineProofGap, PLAYBOOK_CHOICES, playbookStepCount, redactSecrets, reportGapNote, reportGapRequest, reportGaps, skillCheckScript, skillRoutingLinkScript, verifyStepGap } from "./lib/crew-contract.ts";
@@ -112,7 +115,7 @@ import { changeReach, type Reach } from "./owner/reach.ts";
 import { type LiveCheck, hostCanDrive, PROJECTS, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { cardSubject, keyFromEnvFile, ownerRules, ruleAnsweringCard } from "./lib/card-rules.ts";
-import { authFailure, signedIn, signInCommand, wakeCompletionRetryMs, withoutWakeWarning } from "./lib/action-guards.ts";
+import { authFailure, nativeSpawnFailureOutput, signedIn, signInCommand, wakeCompletionRetryMs, withoutWakeWarning } from "./lib/action-guards.ts";
 import { createLeases, LEASE_TTL_MS } from "./lib/test-server-lease.ts";
 import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorrection, LEDGER_FILE, readLedger, within } from "./owner/corrections.ts";
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
@@ -129,6 +132,17 @@ import {
   FIRSTMATE_ATTENTION_MARKER,
   FIRSTMATE_ROUTINE_MARKER,
 } from "./lib/timeline-noise.ts";
+
+const connectorOwnerAnswerSchema = z.object({
+  answer: z.string().nullable(),
+  answeredAt: z.number().int().optional(),
+  tapId: z.string().min(1).max(200).optional(),
+});
+
+function connectorTap(read: { tapId?: string; answeredAt?: number }): { tapId: string; answeredAt: number } | undefined {
+  const tapId = typeof read.tapId === "string" && read.tapId !== "" ? read.tapId : undefined;
+  return tapId !== undefined && Number.isFinite(read.answeredAt) ? { tapId, answeredAt: read.answeredAt as number } : undefined;
+}
 
 const shapeSchema = z.enum(["ship", "scout"]);
 const modeSchema = z.enum(["direct-PR", "no-mistakes", "local-only"]);
@@ -494,6 +508,15 @@ function parseHostRc(raw: string): { exitCode: number; output: string } | null {
     exitCode: Number(match[1]),
     output: text.slice(0, match.index) + text.slice(match.index + match[0].length),
   };
+}
+
+class NativeSpawnAttemptError extends Error {
+  readonly observedExitCode: number | undefined;
+  constructor(message: string, observedExitCode: number | undefined) {
+    super(message);
+    this.name = "NativeSpawnAttemptError";
+    this.observedExitCode = observedExitCode;
+  }
 }
 
 // Wrap a command so its exit code is recoverable from terminal scrollback. The BB
@@ -1648,6 +1671,7 @@ const CAPTAIN_TOOLS = [
   "firstmate_deliver",
   "firstmate_deliveries",
   "firstmate_merge",
+  "firstmate_prod_check",
   "firstmate_lease",
   "firstmate_decide",
   "firstmate_crew",
@@ -1815,14 +1839,42 @@ function isBlankTitle(title: unknown): boolean {
 
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
+  const pluginStartedAt = Date.now();
   const queueStore = createQueueStore(bb.storage.database(), () => bb.storage.kv.get(QUEUE_KEY));
   const launches = createLaunches(bb.storage.database());
+  const activeCreateHandlers = new Map<string, { key: string; token: string }>();
+  function createRequestActive(record: LaunchRecord): boolean {
+    for (const handler of activeCreateHandlers.values()) {
+      if (handler.key === record.key) return true;
+    }
+    return record.createWorkerStarted === true && !(record.updatedAt < pluginStartedAt);
+  }
+  function registerCreateHandler(key: string, token: string): string {
+    const id = randomUUID();
+    activeCreateHandlers.set(id, { key, token });
+    return id;
+  }
+  function unregisterCreateHandler(id: string | undefined): void {
+    if (!id) return;
+    const info = activeCreateHandlers.get(id);
+    if (!info) return;
+    activeCreateHandlers.delete(id);
+    for (const handler of activeCreateHandlers.values()) {
+      if (handler.key === info.key && handler.token === info.token) return;
+    }
+    const latest = launches.get(info.key);
+    if (latest && latest.creationRequested !== true && (latest.attemptToken ?? "") === info.token && latest.createWorkerStarted === true) {
+      launches.update(info.key, { createWorkerStarted: false });
+    }
+  }
+  const CREATE_STILL_RUNNING = "Release refused: a create-worker request is still running. If it never finishes, restart the plugin, then release again.";
   const reports=scoutReports(bb.storage.database());
   const deliveries = createDeliveries(bb.storage.database());
   const quality = createQualityEvents(bb.storage.database());
   const inboundLedger = createInboundLedger(bb.storage.database());
   const ownerAsks = createOwnerAsks(bb.storage.database());
   const productionApprovals = createProductionApprovals(bb.storage.database());
+  const ownerGate = createOwnerGate(bb.storage.database());
   const programs = createPrograms(bb.storage.database());
   const releaseReadbacks = createReleaseReadbacks(bb.storage.database());
   // Owner decision (18 Oct, option A): the strict proof gate covers PRs GitHub says were opened after this
@@ -4134,10 +4186,11 @@ export default async function plugin(bb: BbPluginApi) {
   // fm-brief.sh, then fill its {TASK}/{FIRSTMATE_SPEC} placeholders so real tools
   // (fm-bearings-snapshot, teardown, a manual `fm` relaunch) see a Captain-intent /
   // Firstmate-spec brief for a BB-dispatched crew, not just a synthetic prompt.
-  // Idempotent (never overwrites an existing brief). A missing script is not a
-  // failure; a host or scaffold failure is returned so the caller decides — real
-  // transport cannot spawn without the brief, a BB crew already has its prompt.
-  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  // Skip when brief.md already exists, unless replaceNativeBrief removes it first.
+  // A missing script is not a failure; a host or scaffold failure is returned so
+  // the caller decides — real transport cannot spawn without the brief, a BB crew
+  // already has its prompt.
+  async function publishFmBrief(crew: Crew, hostId: string | undefined, task: string, replaceNativeBrief = false): Promise<{ ok: true } | { ok: false; error: string }> {
     const fmHome = await crewNativeHome(crew);
     if (fmHome === "") return { ok: false, error: "no native home" };
     if (isSecondmateRoute(crew)) return { ok: false, error: "secondmate routes carry no brief" };
@@ -4186,7 +4239,9 @@ export default async function plugin(bb: BbPluginApi) {
       fmBinDirAssign(fmHome),
       fmMirrorStaleGuard(fmHome),
       `[ -f ${briefRef} ] || exit 0`,
-      `[ -f ${shQuote(brief)} ] && exit 0`,
+      replaceNativeBrief
+        ? `rm -f -- ${shQuote(brief)} ${shQuote(`${fmHome}/data/${crew.id}/launch-brief.md`)}`
+        : `[ -f ${shQuote(brief)} ] && exit 0`,
       // F2: do NOT `>/dev/null 2>&1 || exit 0` here — that swallowed a stale-mirror
       // failure (e.g. a missing SCRIPT_DIR sibling in bin-bb) whole. Capture the
       // scaffold's stderr and surface it so publishFmBrief logs it (best-effort still:
@@ -4334,6 +4389,7 @@ export default async function plugin(bb: BbPluginApi) {
       ownsRow?: boolean;
       visible?: boolean;
       checkout?:string;
+      replaceNativeBrief?: boolean;
     },
     hostId: string,
     signal?: AbortSignal,
@@ -4344,7 +4400,10 @@ export default async function plugin(bb: BbPluginApi) {
     // stops while the record is still "reserved" created no thread: it ends failed and
     // holds no crew slot, instead of "uncertain" with a slot nothing will ever fill.
     const pendingKey=launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id);
-    const endedBeforeCreation=(reason:string)=>{ if (launches.get(pendingKey)?.state === "reserved") launches.update(pendingKey,{ state:"failed",error:reason }); };
+    const endedBeforeCreation=(reason:string)=>{
+      const rec=launches.get(pendingKey);
+      if (rec && rec.state === "reserved" && rec.creationRequested !== true && !createRequestActive(rec)) launches.update(pendingKey,{ state:"failed",error:reason });
+    };
     const refused=(message:string)=>{ endedBeforeCreation(message.slice(0,300)); return new Error(message); };
     // Refuse a brief native would refuse BEFORE any backlog row exists, so a bad
     // task never leaves an orphan row behind.
@@ -4390,7 +4449,7 @@ export default async function plugin(bb: BbPluginApi) {
     // Scaffold the authoritative brief first — a ship spawn reads its recorded
     // "Delivery contract: mode=" line and refuses a mismatch, so the brief must
     // exist (with the right mode) before fm-spawn.sh runs.
-    const scaffolded = await publishFmBrief(crew, hostId, input.task);
+    const scaffolded = await publishFmBrief(crew, hostId, input.task, input.replaceNativeBrief === true);
     if (!scaffolded.ok) {
       // Nothing was spawned and no backlog row was added, so the launch holds no slot.
       endedBeforeCreation("Brief could not be written before BB creation");
@@ -4437,9 +4496,12 @@ export default async function plugin(bb: BbPluginApi) {
     if (capped !== undefined) env.FM_BB_PERMISSION_MODE = capped;
     // The canary crew's config directory, built by publishFmBrief above.
     if (waitNoTurnsFor((await settings.get()).waitNoTurnsCrews, crew.id)) env.FM_CONFIG_OVERRIDE = `${fmHome}/state/${crew.id}.wait-config`;
+    const pendingRecord = launches.get(pendingKey);
+    if (pendingRecord?.attemptToken) env.FM_BB_ATTEMPT_TOKEN = pendingRecord.attemptToken;
     let spawnFailed = false;
     let spawnFailure = "Native spawn returned without a recorded worker.";
-    // fm-spawn ran to its end and said no (a number), or never ran (the home's spawn gate).
+    // Observed RC marker for THIS host command, or unknown. Never inferred from error prose.
+    let observedExitCode: number | undefined;
     let spawnEnded = false;
     try {
       const res = await withHomeSpawnGate(fmHome, () => runFmScript({
@@ -4454,10 +4516,13 @@ export default async function plugin(bb: BbPluginApi) {
         signal,
         returnChecked: true,
       }));
+      if (res.fromMarker === true && typeof res.exitCode === "number") observedExitCode = res.exitCode;
       if (res.exitCode !== 0) {
         spawnFailed = true;
-        spawnEnded = typeof res.exitCode === "number" && !TRANSIENT_SPAWN_FAILURE.test(res.output);
-        spawnFailure = `fm-spawn exit ${res.exitCode}: ${withoutWakeWarning(res.output).slice(-2000)}`;
+        spawnEnded = res.fromMarker === true && typeof res.exitCode === "number";
+        spawnFailure = spawnEnded
+          ? `fm-spawn exit ${res.exitCode}: ${nativeSpawnFailureOutput(res.output)}`
+          : `fm-spawn ended without a native return-code marker: ${nativeSpawnFailureOutput(res.output)}`;
         // LOUD (B1): a non-zero fm-spawn exit (e.g. the brief-refusal that made every
         // real spawn fail) must be an error, not a muffled warn.
         bb.log.error(`real transport spawn crew=${crew.id} exit=${res.exitCode} ${res.output.slice(0, 600)}`);
@@ -4491,7 +4556,7 @@ export default async function plugin(bb: BbPluginApi) {
       return orphan;
     }
     // No thread in the native record or in BB, and fm-spawn is no longer running.
-    if (spawnEnded) endedBeforeCreation("Native start ended before BB creation");
+    if (spawnEnded && typeof observedExitCode === "number") endedBeforeCreation(spawnFailure);
     // Native retains queued work when policy refuses a spawn (for example an AFK cap).
     // Keep that row available for reconciliation instead of deleting it and bypassing the gate.
     // A refused BRIEF is different: the row names a task that can never spawn as written,
@@ -4503,7 +4568,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       bb.log.warn(`real transport: could not remove refused-brief backlog row ${crew.id}: ${rm === null ? "host unavailable" : rm.output.slice(-300)}`);
     }
-    throw new Error(`${spawnFailure} Task ${crew.id} remains in the native backlog.`);
+    throw new NativeSpawnAttemptError(`${spawnFailure} Task ${crew.id} remains in the native backlog.`, observedExitCode);
   }
 
   // A crew is terminal — its task is over — when its turn failed, its thread is
@@ -5181,14 +5246,33 @@ export default async function plugin(bb: BbPluginApi) {
     if (flags.has("shared-env") && shape === "ship") throw new Error("Native ship isolation is mandatory.");
     const nativePid=flagStr(flags,"native-pid");
     if (!nativePid || !/^\d+$/.test(nativePid)) throw new Error("Internal creation requires a native spawn process identity.");
+    const attemptToken=flagStr(flags,"attempt-token");
     const admission=await runOnHost(hostId,["set -eu",
       `test -d ${shQuote(`${home}/state/.spawn-${taskId}.lock`)}`,
       `[ "$(cat ${shQuote(`${home}/state/.spawn-${taskId}.lock/pid`)})" = ${shQuote(nativePid)} ]`,
       `kill -0 ${shQuote(nativePid)}`,
       `native_command=$(ps -p ${shQuote(nativePid)} -o command=)`,
       `case "$native_command" in *fm-spawn.sh*) ;; *) echo 'error: creation must follow native fm-spawn guards' >&2; exit 1 ;; esac`,
+      `python3 -c ${shQuote(ATTEMPT_TOKEN_ENVIRON_PY)} ${shQuote(nativePid)}`,
     ].join("\n"),15_000,launchAbort.signal);
     requireNativeSuccess(admission,"native launch admission proof");
+    const myToken=attemptToken ?? attemptTokenFromAdmissionOutput(admission.output) ?? "";
+    const key = launchKey(projectId, owner, home, taskId);
+    let handlerId: string | undefined;
+    try {
+    const refuseSupersededCreate = (record: LaunchRecord | undefined) => {
+      if (record?.state === "failed") throw new Error("Creation refused: this launch attempt was failed or superseded.");
+    };
+    let bound = launches.get(key);
+    refuseSupersededCreate(bound);
+    if (bound && bound.state !== "deleted") {
+      if ((bound.attemptToken ?? "") !== myToken) throw new Error("Creation refused: attempt token mismatch.");
+      launches.update(key, { createWorkerStarted: true });
+      handlerId = registerCreateHandler(key, myToken);
+    } else if (!bound) {
+      bound = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,creationRequested:false,attemptToken: myToken || undefined,createWorkerStarted:true,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
+      handlerId = registerCreateHandler(key, myToken);
+    }
     const selection = await selectExecution(bb, projectId, hostId);
     if (shape !== "secondmate" && selection.checkout !== path) throw new Error("Native project path does not match selected host checkout.");
     const permissionMode = capPermission(toPermissionMode(flagStr(flags, "permission-mode")), await parentPermission(owner || undefined));
@@ -5214,8 +5298,9 @@ export default async function plugin(bb: BbPluginApi) {
     const read = await bb.sdk.files.read({ hostId, path: promptFile });
     if (!("content" in read) || read.sizeBytes > 1_000_000) throw new Error("Native prompt is missing or exceeds 1MB.");
     const prompt = read.contentEncoding === "base64" ? Buffer.from(read.content,"base64").toString("utf8") : read.content;
-    const key = launchKey(projectId, owner, home, taskId);
-    let record = await launches.reserve({ key, taskId, projectId, owner, home, generation:1,shape,nativeInvoked:true,deliveryMode:flagStr(flags,"delivery-mode"),deliveryRequirement:z.enum(["pr","merged","merged-and-verified"]).parse(flagStr(flags,"delivery-requirement") ?? "merged"),state:"reserved",threadId:null,hostId,updatedAt:Date.now() }, () => launchCapacity(owner || undefined));
+    let record = launches.get(key);
+    refuseSupersededCreate(record);
+    if (!record) throw new Error("Creation refused: launch reservation missing.");
     record = await reconcileLaunch(record);
     const suppliedContract=flagStr(flags,"delivery-requirement");
     if (suppliedContract && suppliedContract !== recoveredContract({},record)) throw new Error("Creation retry cannot change the original delivery contract.");
@@ -5229,7 +5314,7 @@ export default async function plugin(bb: BbPluginApi) {
       visibility:flags.has("hidden") ? "hidden" : "visible",
       pluginMetadata: { launchKey:key,generation:1,nativeHome:shape === "secondmate" ? path : home,
         ...(shape === "secondmate" ? { captain:"true",nativeTaskId:taskId,nativeParentHome:home,...(parentRuntime?{nativeRuntimeRelease:parentRuntime.release}:{}) } : { crew:"true",crewId:taskId,shape,posture:flagStr(flags,"delivery-mode") ?? "direct-PR",worktree:!flags.has("shared-env"),deliveryRequirement:recoveredContract({},record) }) },
-    }), launchAbort.signal);
+    }), launchAbort.signal, 30_000, myToken);
     if (shape === "secondmate") {
       if(parentRuntime) {
         const bound=await nativeRuntime.operation(hostId,"bind-seeded",{home:path,captain:created.threadId!,release:parentRuntime.release,parentHome:home,parentCaptain:owner,taskId},launchAbort.signal);
@@ -5258,6 +5343,9 @@ export default async function plugin(bb: BbPluginApi) {
     } while (Date.now()<deadline);
     launches.update(key,{ state:"provisioning",error:"Environment is still provisioning; native isolation guard has not run." });
     throw new Error(`Worker ${created.threadId} is still provisioning. It is retained under task ${taskId}; reconcile before retrying.`);
+    } finally {
+      unregisterCreateHandler(handlerId);
+    }
   }
 
   function strictReasoning(value: unknown): ReasoningLevel | undefined {
@@ -5640,8 +5728,12 @@ export default async function plugin(bb: BbPluginApi) {
         }));
       },
       details: (record) => prDetails(record, signal),
-      markLive: (task, evidence, check) => {
-        try { ownerTasks.move(task.id, captain, { to: "live", reason: evidence, checked: check }, now); return true; }
+      markLive: async (task, evidence, check) => {
+        try {
+          await sightDeploy({ project: task.project ?? "", task: task.id, source: "live-pass", detail: evidence });
+          ownerTasks.move(task.id, captain, { to: "live", reason: evidence, checked: check }, now);
+          return true;
+        }
         catch (error) { bb.log.info(`live check: ${task.id} stays merged: ${error instanceof Error ? error.message : String(error)}`); return false; }
       },
       alert: async (project, text, incident) => {
@@ -6254,14 +6346,17 @@ export default async function plugin(bb: BbPluginApi) {
   /** Send one ask card to the Telegram connector. Returns "" when queued, else why it was not. */
   async function sendAskCard(ask: OwnerAsk, route: { project?: string; task?: string } = {}): Promise<string> {
     const gated = !mayDefault(ask);
+    const round = isRoundAsk(ask);
     try {
       const sent = z.object({ queued: z.number(), duplicate: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
         pluginId: TELEGRAM_BRIDGE_PLUGIN_ID,
         method: "ask",
         input: {
-          askId: ask.id, text: formatAskCard(ask), options: ask.options, ...(ask.recommended !== null ? { recommended: ask.recommended } : {}),
+          askId: ask.id, text: round ? formatAskRound(ask) : formatAskCard(ask), options: round ? [] : ask.options,
+          ...(!round && ask.recommended !== null ? { recommended: ask.recommended } : {}),
           // The connector folds reversible cards sent within a minute into one message with "Accept all recommended".
-          card: { kind: ask.kind, question: ask.text, ...(ask.impact ? { impact: ask.impact } : {}), defaultAt: ask.defaultAt, gated },
+          // A grilling round is one plain message: empty options, no pack card.
+          ...(round ? {} : { card: { kind: ask.kind, question: ask.text, ...(ask.impact ? { impact: ask.impact } : {}), defaultAt: ask.defaultAt, gated } }),
           // With Telegram topics on the card goes to its project's topic; without it the connector asks Decisions.
           ...(route.project?.trim() ? { project: route.project.trim() } : {}),
           ...(route.task !== undefined ? { task: route.task } : {}),
@@ -6834,6 +6929,80 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
+  async function inspectSpawnLock(record: LaunchRecord, signal?: AbortSignal): Promise<"absent" | "dead" | "live"> {
+    if (!record.hostId) throw new Error("Release requires the launch host to inspect the spawn lock.");
+    const lock = `${record.home}/state/.spawn-${record.taskId}.lock`;
+    const result = await runOnHost(record.hostId, [
+      "set +e",
+      `lock=${shQuote(lock)}`,
+      `if [ ! -d "$lock" ]; then echo FM_SPAWN_LOCK=absent; exit 0; fi`,
+      `pid=$(cat "$lock/pid" 2>/dev/null || true)`,
+      `if [ -z "$pid" ]; then echo FM_SPAWN_LOCK=dead; exit 0; fi`,
+      `if ! kill -0 "$pid" 2>/dev/null; then echo FM_SPAWN_LOCK=dead; exit 0; fi`,
+      `native_command=$(ps -p "$pid" -o command=)`,
+      `case "$native_command" in *fm-spawn.sh*) echo FM_SPAWN_LOCK=live ;; *) echo FM_SPAWN_LOCK=dead ;; esac`,
+    ].join("\n"), 15_000, signal);
+    const match = /FM_SPAWN_LOCK=(absent|dead|live)/.exec(result.output);
+    if (result.exitCode !== 0 || !match) throw new Error("Spawn lock inspection did not report a state.");
+    return match[1] as "absent" | "dead" | "live";
+  }
+
+  function releaseEligible(record: LaunchRecord | undefined, boundHome: string): record is LaunchRecord {
+    return !!record && record.state === "uncertain" && !record.threadId && record.creationRequested !== true && !record.adoption && record.home === boundHome && !createRequestActive(record);
+  }
+
+  async function inventoryForRelease(record: LaunchRecord, signal: AbortSignal) {
+    if (record.creationRequested === undefined) return discoverLaunchComplete(bb, record, signal);
+    return discoverLaunch(bb, record, signal);
+  }
+
+  async function releaseStuckLaunch(taskId: string, owner: string, projectId: string, callerSignal?: AbortSignal) {
+    if (!/^[A-Za-z0-9._-]{1,100}$/.test(taskId) || [".", ".."].includes(taskId)) throw new Error("Exact task identity is required.");
+    const signal = AbortSignal.any([launchAbort.signal, ...(callerSignal ? [callerSignal] : [])]);
+    const home = await raceAbort(bb.storage.kv.get<string>(`native-home:${owner}`), signal, STUCK_HOST_CALL_MS);
+    if (!home || home !== (await settings.get()).fmHome.trim()) throw new Error("Release requires the owning captain's explicitly bound native home.");
+    const captain = await raceAbort(bb.sdk.threads.get({ threadId: owner, signal }), signal, STUCK_HOST_CALL_MS);
+    const captainMeta = await raceAbort(bb.sdk.threads.getPluginMetadata({ threadId: owner, signal }), signal, STUCK_HOST_CALL_MS);
+    if (!metaFlag(captainMeta, "captain") || captain.projectId !== projectId || captain.archivedAt || captain.deletedAt) throw new Error("Release must run in the live owning captain and exact project context.");
+    const record = launches.forTask(projectId, owner, taskId);
+    if (!record) throw new Error(`No launch for ${taskId} in this captain and project.`);
+    if (record.state !== "uncertain") throw new Error(`Release refused: state is ${record.state}.`);
+    if (record.threadId) throw new Error("Release refused: a thread is already recorded.");
+    if (record.creationRequested === true) throw new Error("Release refused: creation was requested.");
+    if (record.adoption) throw new Error("Release refused: adoption is in progress.");
+    if (record.home !== home) throw new Error("Release refused: launch home does not match the bound native home.");
+    if (createRequestActive(record)) throw new Error(CREATE_STILL_RUNNING);
+    if (record.creationRequested === undefined && !(record.updatedAt < pluginStartedAt)) {
+      throw new Error("Release refused: no plugin process boundary after the record's last update.");
+    }
+    return launches.once(`release:${record.key}`, async () => {
+      const current = launches.get(record.key);
+      if (!releaseEligible(current, home)) throw new Error("Release refused: the launch changed before the slot could be freed.");
+      const snapshot = current;
+      const lock = await inspectSpawnLock(current, signal);
+      if (lock === "live") throw new Error("Release refused: a live fm-spawn lock is still held.");
+      const first = await inventoryForRelease(current, signal);
+      if (first) throw new Error(`Release refused: a matching thread ${first} exists.`);
+      await raceAbort(sleep(30_000), signal);
+      signal.throwIfAborted();
+      const latest = launches.get(record.key);
+      if (!releaseEligible(latest, home) || latest.updatedAt !== snapshot.updatedAt) {
+        throw new Error("Release refused: the launch changed during the wait.");
+      }
+      const second = await inventoryForRelease(latest, signal);
+      if (second) throw new Error(`Release refused: a matching thread ${second} exists.`);
+      const lockAfter = await inspectSpawnLock(latest, signal);
+      if (lockAfter === "live") throw new Error("Release refused: a live fm-spawn lock is still held.");
+      if (createRequestActive(latest)) throw new Error(CREATE_STILL_RUNNING);
+      if (latest.creationRequested === undefined && !(snapshot.updatedAt < pluginStartedAt)) {
+        throw new Error("Release refused: no plugin process boundary after the record's last update.");
+      }
+      const reason = "Released: no worker was created; two discovery reads 30s apart found no thread and the spawn lock is not live.";
+      const released = launches.compareAndReleaseFailed(snapshot, home, reason, pluginStartedAt);
+      return { taskId: released.taskId, state: "failed" as const };
+    });
+  }
+
   async function reconcileLaunch(record: LaunchRecord,signal=launchAbort.signal): Promise<LaunchRecord> {
     if (record.adoption?.phase === "publishing") throw new Error(`Launch ${record.taskId} has an interrupted explicit adoption; repeat launches adopt with its exact worker identity.`);
     if (record.threadId) return record;
@@ -6885,8 +7054,14 @@ export default async function plugin(bb: BbPluginApi) {
     const home = (await settings.get()).fmHome.trim();
     const key = launchKey(input.projectId, input.parentThreadId ?? "", home, taskId);
     return launches.once(`dispatch:${key}`, async () => {
+      const prior = launches.get(key);
+      // A failed attempt that proves no worker and no creation request rewrites the native brief
+      // for this request, even when its saved shape already matches: an earlier retry may have
+      // saved the new shape and then failed before its brief rewrite (host staging).
+      const replaceNativeBrief = prior !== undefined && prior.state === "failed" && !prior.threadId && prior.creationRequested === false && !createRequestActive(prior);
+      if (prior && prior.shape !== input.shape && !replaceNativeBrief) throw new Error(`Start ${taskId} under a new id.`);
       const record = await launches.reserve({ key, taskId, projectId: input.projectId, owner: input.parentThreadId ?? "",
-        home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
+        home, generation: 1, shape: input.shape, deliveryMode:input.mode, yolo:input.yolo, deliveryRequirement:input.deliveryRequirement ?? "merged", state: "reserved", threadId: null, creationRequested: false, attemptToken: randomUUID(), updatedAt: Date.now() }, () => launchCapacity(input.parentThreadId));
       const resolved = await reconcileLaunch(record);
       if (resolved.state === "deleted") throw new Error(`Worker for launch ${taskId} was deleted by BB core. This attempt cannot be resumed.`);
       if (input.deliveryRequirement && input.deliveryRequirement !== recoveredContract({},resolved)) throw new Error("Retry cannot change the original delivery contract.");
@@ -6904,7 +7079,7 @@ export default async function plugin(bb: BbPluginApi) {
         return recovered;
       }
       try {
-        const crew = await dispatchCrewBody({ ...input, crewId: taskId, ownsRow:input.crewId === undefined });
+        const crew = await dispatchCrewBody({ ...input, crewId: taskId, ownsRow:input.crewId === undefined, replaceNativeBrief });
         crew.launchKey = key;
         let actualProvider = crew.providerId;
         let thread: Awaited<ReturnType<typeof bb.sdk.threads.defaultExecutionOptions>> | null = null;
@@ -6922,7 +7097,9 @@ export default async function plugin(bb: BbPluginApi) {
         return crew;
       } catch (error) {
         const latest = launches.get(key)!;
-        if (latest.state === "reserved" && !latest.nativeInvoked) launches.update(key, { state: "failed", error: String(error) });
+        const observed = error instanceof NativeSpawnAttemptError ? error.observedExitCode : undefined;
+        const inFlight = createRequestActive(latest);
+        if (latest.state === "reserved" && latest.creationRequested !== true && !inFlight && (!latest.nativeInvoked || (typeof observed === "number" && observed !== 0))) launches.update(key, { state: "failed", error: String(error) });
         else if (latest.state !== "failed" && latest.state !== "deleted") launches.update(key, { state: latest.threadId ? "provisioning" : "uncertain", error: String(error) });
         const ended = launches.get(key)?.state ?? "uncertain";
         const next = ended === "failed"
@@ -6957,6 +7134,7 @@ export default async function plugin(bb: BbPluginApi) {
     sendAt?: number;
     deliveryRequirement?: "pr" | "merged" | "merged-and-verified";
     sourceRefs?: string[];
+    replaceNativeBrief?: boolean;
     ownerRequestedProvider?: boolean;
     /** The owner's message ref that permits a model needing his permission (owner/crew-roles.ts). */
     modelPermission?: string;
@@ -7092,7 +7270,8 @@ export default async function plugin(bb: BbPluginApi) {
           crew,
           { task: input.task, projectId: input.projectId, parentThreadId: input.parentThreadId,
             title: input.title, permissionMode: input.permissionMode,
-            ownsRow: input.ownsRow, visible: input.visible,checkout:selection.checkout },
+            ownsRow: input.ownsRow, visible: input.visible,checkout:selection.checkout,
+            replaceNativeBrief: input.replaceNativeBrief === true },
           rtHost,input.signal,
         );
         if (realThreadId !== null && realThreadId !== "") {
@@ -7116,6 +7295,9 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         bb.log.error(`real transport refused crew=${crew.id}: ${reason}`);
+        if (error instanceof NativeSpawnAttemptError) {
+          throw new NativeSpawnAttemptError(`Real dispatch ${crew.id} stopped: ${reason}`, error.observedExitCode);
+        }
         throw new Error(`Real dispatch ${crew.id} stopped: ${reason}`);
       }
     }
@@ -7411,7 +7593,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
     const key = launchKey(crew.projectId,crew.parentThreadId ?? "",crew.nativeHome ?? "",crew.id,plan.generation);
     let reservation = await launches.reserve({ key,taskId:crew.id,projectId:crew.projectId,owner:crew.parentThreadId ?? "",home:crew.nativeHome ?? "",
-      generation:plan.generation,replacement:plan.contract,shape:crew.shape,deliveryMode:crew.posture,deliveryRequirement:crew.deliveryRequirement,state:"reserved",threadId:null,hostId:reusedEnvironment.hostId,path:reusedEnvironment.path ?? undefined,updatedAt:Date.now() }, () => launchCapacity(crew.parentThreadId ?? undefined),opts.overCap);
+      generation:plan.generation,replacement:plan.contract,shape:crew.shape,deliveryMode:crew.posture,deliveryRequirement:crew.deliveryRequirement,state:"reserved",threadId:null,hostId:reusedEnvironment.hostId,path:reusedEnvironment.path ?? undefined,updatedAt:Date.now() }, () => launchCapacity(crew.parentThreadId ?? undefined),opts.overCap,plan.supersede?.key);
     if (JSON.stringify(reservation.replacement?.target)!==JSON.stringify(plan.contract.target) || reservation.replacement?.sourceThreadId!==crew.threadId || reservation.replacement.intent!==intent || reservation.replacement.reason!==note) throw new Error("Replacement reservation conflicts with this exact request.");
     reservation = await reconcileLaunch(reservation);
     if (fmHome) {
@@ -8648,7 +8830,10 @@ export default async function plugin(bb: BbPluginApi) {
   async function readDelivery(record:DeliveryRecord,signal?:AbortSignal):Promise<DeliveryRecord> {
     return serializeLedger(`delivery:${record.id}`,async()=>{
     record=deliveries.get(record.id) ?? record;
-    if (["complete","explicitly-abandoned"].includes(record.status)) return record;
+    if (["complete","explicitly-abandoned"].includes(record.status)) {
+      if (record.headSha && ownerGate.statusPostNeeded(record.id, record.headSha)) await retryOwnerApprovalStatus(record.id, record.headSha);
+      return record;
+    }
     try {
       // The forge state is read whatever happened to the manager: a merged or
       // closed PR must leave the open list even when its captain is gone.
@@ -8666,7 +8851,19 @@ export default async function plugin(bb: BbPluginApi) {
       const authorized=posture.yolo && !!posture.provenance;
       const unverifiedStanding=!posture.provenance && (posture.yolo || record.continuation?.["yolo"]===true);
       signal?.throwIfAborted();
-      const observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+      const previousHead = record.headSha ?? "";
+      let observed=deliveries.observe(record.id,observation,authorized,Date.now(),unverifiedStanding);
+      if (observed.status === "merged-needs-verification" && ownerWorksHeadTap(observed)) {
+        const applied = await applyOwnerWorksTapToMerge(observed, signal);
+        if (applied.ok) observed = applied.record;
+        else bb.log.warn(`same-tree owner tap ${observed.id}: ${applied.reason}`);
+      }
+      if (observed.headSha && (observed.headSha !== previousHead || ownerGate.statusPostNeeded(observed.id, observed.headSha))) {
+        // A background pass saves the post for its end-of-pass drain, so PR reads come first.
+        // An explicit reconcile posts at once.
+        if (backgroundBudget.getStore() !== undefined) ownerGate.queueStatusPost(observed.id, observed.headSha, Date.now());
+        else await syncOwnerApprovalStatus(observed.id, observed.headSha, hostId || null, taskForPr(observed.id, observed.owner, observed.taskId));
+      }
       // Without a manager nobody acts on minute-by-minute health; look less often until it merges or closes.
       if (observed.ownerNeeded && !["complete","explicitly-abandoned","merged-unverified"].includes(observed.status)) return deliveries.save({...observed,nextCheckAt:Date.now()+LOST_OWNER_RECHECK_MS});
       return observed;
@@ -8773,7 +8970,7 @@ export default async function plugin(bb: BbPluginApi) {
           } catch (error) {
             if (signal?.aborted) throw error;
             await retryFailed({ kind: "launch-reconcile", subject: record.key, owner: record.owner || null, label: `Launch ${record.taskId}`,
-              hint: `Its slot is retained. Dispatch again with taskId=${record.taskId} to reconcile, or adopt the exact worker.`,
+              hint: `Its slot is retained. Dispatch again with taskId=${record.taskId} to reconcile, adopt the exact worker, or bb firstmate launches release ${record.taskId} when no worker was created.`,
               reason: error instanceof Error ? error.message : String(error), logPrefix: (attempt) => `Launch reconciliation ${record.taskId} (attempt ${attempt})` }, signal);
           }
         }
@@ -9252,16 +9449,18 @@ export default async function plugin(bb: BbPluginApi) {
   // host's meter; a response's own headers then set the true value. Outside the loop
   // (verdicts, merges) the request always runs and still debits the meter.
   // cost is the GitHub requests one call can make: a PR status read through BB is up to 2.
-  function reserveGithub(hostId: string | null, probe = false, cost = 1): boolean {
-    const meter = hostId === null ? undefined : graphqlMeters.get(hostId);
+  // REST tree reads pass rest=true: they take the hourly allowance and skip GraphQL
+  // reserve and meter, which stay for GraphQL PR reads.
+  function reserveGithub(hostId: string | null, probe = false, cost = 1, rest = false): boolean {
+    const meter = rest || hostId === null ? undefined : graphqlMeters.get(hostId);
     const pool = backgroundBudget.getStore();
     if (pool === "sweep") {
       if (sweepAllowance() < cost) return false;
-      if (!probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
+      if (!rest && !probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
       for (let i = 0; i < cost; i++) sweepReads.push(Date.now());
     } else if (pool) {
       if (backgroundAllowance() < cost) return false;
-      if (!probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
+      if (!rest && !probe && hostId !== null && graphqlReadsAllowed(hostId, cost) === 0) return false;
       for (let i = 0; i < cost; i++) backgroundReads.push(Date.now());
       paceTokens -= cost;
     }
@@ -9449,12 +9648,115 @@ export default async function plugin(bb: BbPluginApi) {
         await follow(record);
       }
     }));
+    // Saved owner approval status posts go after the PR reads, from what the allowance has left:
+    // a new head's first post and every retry, for active, completed and abandoned deliveries.
+    // They are read on their own, so finished deliveries are not polled again. A post for a head
+    // the PR no longer has is dropped.
+    for (const { pr, head } of ownerGate.pendingStatusPosts().slice(0, FOLLOW_UP_DUE_LIMIT)) {
+      signal?.throwIfAborted();
+      if (backgroundAllowance() <= 0) break;
+      const current = deliveries.get(pr)?.headSha;
+      if (current && current !== head) { ownerGate.clearStatusPost(pr, head); continue; }
+      await boundedFollowUp(() => serializeLedger(`delivery:${pr}`, () => retryOwnerApprovalStatus(pr, head)), signal)
+        .catch(error => bb.log.warn(`Owner approval status retry ${pr}: ${String(error)}`));
+    }
     await backgroundBudget.run("sweep", () => retireEndedRetainedRecords(cycleLists, signal)).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
     // Notification failure stays due independently of forge polling backoff.
     for (const record of deliveries.pendingNotifications()) {
       if (record.notification.desired !== record.notification.delivered) await boundedFollowUp(s=>notifyDelivery(record,s),signal).catch(error=>bb.log.warn(`PR notification ${record.id}: ${String(error)}`));
     }
     await askPrDecisions(signal).catch(error=>{ if (!signal?.aborted) bb.log.warn(`PR decision list: ${String(error)}`); });
+  }
+  // Commit trees never change. Cache hits skip GitHub; in-flight reads share one request;
+  // a failed lookup cools down so observations do not retry it immediately.
+  const TREE_FAIL_COOLDOWN_MS = 60_000;
+  const commitTreeCache = new Map<string, string>();
+  const commitTreeFailUntil = new Map<string, number>();
+  const commitTreeInFlight = new Map<string, Promise<string>>();
+  const commitTreeMismatch = new Map<string, string>();
+  function commitTreeKey(hostId: string, repo: string, sha: string) {
+    return `${hostId}\n${repo.toLowerCase()}\n${sha}`;
+  }
+  function commitTreePairKey(hostId: string, repo: string, a: string, b: string) {
+    return a < b ? `${hostId}\n${repo.toLowerCase()}\n${a}\n${b}` : `${hostId}\n${repo.toLowerCase()}\n${b}\n${a}`;
+  }
+  async function githubCommitTree(hostId: string, repo: string, sha: string, signal?: AbortSignal): Promise<string> {
+    const full = fullCommitSha(sha);
+    if (!full) throw new Error(`GitHub did not return a tree for ${sha.slice(0, 7)}: commit is not a full identity`);
+    const key = commitTreeKey(hostId, repo, full);
+    const cached = commitTreeCache.get(key);
+    if (cached !== undefined) return cached;
+    const coolUntil = commitTreeFailUntil.get(key);
+    if (coolUntil !== undefined && Date.now() < coolUntil) {
+      throw new Error(`GitHub did not return a tree for ${full.slice(0, 7)}: retry cooling down`);
+    }
+    const shared = commitTreeInFlight.get(key);
+    if (shared) return shared;
+    const request = (async () => {
+      if (backgroundBudget.getStore() && !reserveGithub(hostId, false, 1, true)) throw new GithubReservePaused(hostId);
+      let res: { exitCode: number; output: string; stderr: string };
+      try {
+        res = await runStructuredOnHost(hostId, `gh api ${shQuote(`repos/${repo}/git/commits/${full}`)} --jq .tree.sha`, 30_000, signal);
+      } catch (error) {
+        commitTreeFailUntil.set(key, Date.now() + TREE_FAIL_COOLDOWN_MS);
+        throw new Error(`GitHub did not return a tree for ${full.slice(0, 7)}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (res.exitCode !== 0) {
+        commitTreeFailUntil.set(key, Date.now() + TREE_FAIL_COOLDOWN_MS);
+        throw new Error(`GitHub did not return a tree for ${full.slice(0, 7)}: ${res.stderr || res.output || `exit ${res.exitCode}`}`);
+      }
+      const tree = res.output.trim().replace(/^"|"$/g, "");
+      if (!/^[0-9a-f]{40}$/i.test(tree)) {
+        commitTreeFailUntil.set(key, Date.now() + TREE_FAIL_COOLDOWN_MS);
+        throw new Error(`GitHub tree for ${full.slice(0, 7)} was unreadable`);
+      }
+      const value = tree.toLowerCase();
+      commitTreeCache.set(key, value);
+      commitTreeFailUntil.delete(key);
+      return value;
+    })();
+    commitTreeInFlight.set(key, request);
+    try { return await request; }
+    finally { if (commitTreeInFlight.get(key) === request) commitTreeInFlight.delete(key); }
+  }
+  async function compareOwnerTapTrees(hostId: string, repo: string, tappedSha: string, mergeSha: string, signal?: AbortSignal): Promise<{ ok: true; treeSha: string } | { ok: false; reason: string; temporary: boolean }> {
+    const x = fullCommitSha(tappedSha), m = fullCommitSha(mergeSha);
+    if (!x || !m) {
+      return { ok: false, temporary: false, reason: `Refusing: GitHub did not return trees for ${(tappedSha || "").slice(0, 7)} and ${(mergeSha || "").slice(0, 7)}, so the Works tap cannot cover the merge commit: commit is not a full identity` };
+    }
+    const pair = commitTreePairKey(hostId, repo, x, m);
+    const known = commitTreeMismatch.get(pair);
+    if (known !== undefined) return { ok: false, reason: known, temporary: false };
+    let treeX: string, treeM: string;
+    try {
+      treeX = await githubCommitTree(hostId, repo, x, signal);
+      treeM = await githubCommitTree(hostId, repo, m, signal);
+    } catch (error) {
+      return { ok: false, temporary: true, reason: `Refusing: GitHub did not return trees for ${x.slice(0, 7)} and ${m.slice(0, 7)}, so the Works tap cannot cover the merge commit: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (treeX !== treeM) {
+      const reason = `Refusing: the owner's Works tap covers ${x.slice(0, 7)}, and GitHub's trees differ from merge commit ${m.slice(0, 7)} (${treeX.slice(0, 7)} vs ${treeM.slice(0, 7)}).`;
+      commitTreeMismatch.set(pair, reason);
+      return { ok: false, reason, temporary: false };
+    }
+    return { ok: true, treeSha: treeX };
+  }
+  async function applyOwnerWorksTapToMerge(r: DeliveryRecord, signal?: AbortSignal): Promise<{ ok: true; record: DeliveryRecord } | { ok: false; reason: string }> {
+    const tap = ownerWorksHeadTap(r);
+    if (!tap) return { ok: false, reason: `Refusing: ${r.id} has no owner Works tap on its head to cover the merge commit.` };
+    if (r.status !== "merged-needs-verification") return { ok: false, reason: `Refusing: ${r.id} is ${r.status}, not merged-needs-verification` };
+    let hostId: string;
+    try { hostId = await resolveHostForProject(r.projectId, r.owner ?? undefined, signal); }
+    catch (error) {
+      return { ok: false, reason: `Refusing: GitHub did not return trees for ${tap.tappedSha.slice(0, 7)} and ${tap.mergeSha.slice(0, 7)}, so the Works tap cannot cover the merge commit: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    const compared = await compareOwnerTapTrees(hostId, r.repository, tap.tappedSha, tap.mergeSha, signal);
+    if (!compared.ok) return compared;
+    const v = r.verification!;
+    return { ok: true, record: deliveries.verify(r.id, OWNER_ACTOR, tap.mergeSha, {
+      driven: v.driven, seen: v.seen, surface: v.surface, build: v.build,
+      tappedCommitSha: tap.tappedSha, treeSha: compared.treeSha,
+    }) };
   }
   const deliveryParams = z.object({
     action:z.enum(["list","inspect","register","reconcile","assign","abandon","clear-hold","verify","check","account","device-proof","release"]),
@@ -9570,6 +9872,14 @@ export default async function plugin(bb: BbPluginApi) {
     }
     if (input.action === "check") return [await recordCheckerVerdict(live,owner,input.commitSha ?? "",input.verdict,input.notes ?? "",input.findings)];
     if (input.action === "verify") {
+      const given = (input.commitSha ?? "").trim();
+      const tap = ownerWorksHeadTap(live);
+      const coversTap = tap !== null && given.length >= 7 && (live.mergeCommitSha?.toLowerCase().startsWith(given.toLowerCase()) === true || live.headSha?.toLowerCase().startsWith(given.toLowerCase()) === true);
+      if (coversTap) {
+        const applied = await applyOwnerWorksTapToMerge(live, verdictSignal);
+        if (applied.ok) return [applied.record];
+        throw new Error(applied.reason);
+      }
       // Owner decision Q6: a crew drives the change and records it under its own crew id. The
       // captain never verifies for itself (#2523 and dr.woo#124, 15-17 Oct).
       // A PR opened before the strict gate went live keeps the old rules: the captain or a crew records it, with no surface rule.
@@ -9642,6 +9952,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (!/^[0-9a-f]{7,40}$/i.test(commit)) throw new Error(`A release read-back needs commitSha: the commit the build was built from (EAS shows it as gitCommitHash: eas build:view <build id> --json). It proves only the merges that commit holds; a build time is not proof.${fromEas}`);
       if (group.toLowerCase() !== rule.release.group.toLowerCase()) throw new Error(`Refusing: ${rule.name} builds must be in the "${rule.release.group}" public-link group, not "${group}". Add build ${build} to "${rule.release.group}", read it back from App Store Connect or EAS, then record it again.`);
       const recorded = releaseReadbacks.record({ task: task.id, captain: task.captain, crewId: crew.id, project: rule.name, build, group: rule.release.group, source: input.source as ReleaseSource, seen, at: Date.now(), ...(commit ? { commit } : {}), ...(builtAt !== undefined ? { builtAt } : {}) });
+      await sightDeploy({ project: rule.name, task: task.id, source: "release-readback", detail: `build ${recorded.build} in ${recorded.group}` });
       return `Release read-back recorded for ${task.id}: build ${recorded.build} in "${recorded.group}" (read from ${recorded.source === "eas" ? "EAS" : "App Store Connect"}: ${recorded.seen}).`;
     }
     const id = input.id ?? (input.url ? canonicalPr(input.url).id : "");
@@ -9721,10 +10032,24 @@ export default async function plugin(bb: BbPluginApi) {
     const timer = setTimeout(() => {
       if (proofRechecks.get(askId) !== timer) return;
       proofRechecks.delete(askId);
-      if (!launchAbort.signal.aborted) void drainAskFollowUps().catch((error) => bb.log.warn(`device proof ${askId} recheck: ${String(error)}`));
+      if (!launchAbort.signal.aborted) void backgroundBudget.run("follow-up", () => drainAskFollowUps()).catch((error) => bb.log.warn(`device proof ${askId} recheck: ${String(error)}`));
     }, delays[attempt]!);
     timer.unref?.();
     proofRechecks.set(askId, timer);
+  }
+  function scheduleTreeProofRetry(askId: string): void {
+    if (proofRechecks.has(askId)) return;
+    const timer = setTimeout(() => {
+      if (proofRechecks.get(askId) !== timer) return;
+      proofRechecks.delete(askId);
+      if (!launchAbort.signal.aborted) void backgroundBudget.run("follow-up", () => drainAskFollowUps()).catch((error) => bb.log.warn(`device proof ${askId} tree retry: ${String(error)}`));
+    }, TREE_FAIL_COOLDOWN_MS);
+    timer.unref?.();
+    proofRechecks.set(askId, timer);
+  }
+  function laterOwnerAnswer(askId: string, seq: number): boolean {
+    return [...ownerAsks.pendingFollowUps(), ...ownerAsks.failedFollowUps()]
+      .some((job) => job.askId === askId && job.effect === "owner-answered" && job.answerSeq > seq);
   }
   async function dropDeviceProof(askId: string): Promise<void> {
     const timer = proofRechecks.get(askId);
@@ -9775,30 +10100,71 @@ export default async function plugin(bb: BbPluginApi) {
         }
         return { status: "retryable", error: "waiting for owner tap confirmation" };
       }
-      let note: string;
+      const evidence = { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build };
+      const refusePermanent = async (reason: string): Promise<FollowUpResult> => {
+        await dropDeviceProof(askId);
+        const note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${reason} Open a new device proof card for the current head.`;
+        bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
+        await tell(note);
+        return { status: "completed" };
+      };
+      const retryTree = (count = true): FollowUpResult => {
+        scheduleTreeProofRetry(askId);
+        return { status: "retryable", error: count ? "waiting for commit tree" : "waiting for github allowance" };
+      };
       try {
         // A tap can come hours after the card: read the PR from GitHub first, so the record covers its head now.
         const row = deliveries.get(proof.pr);
         if (row !== undefined && row.freshness !== "fresh") await reconcileDelivery(row);
-        // The card may have been cancelled or replaced while the reads above were in flight: read the binding
-        // again, then check the card with no await between that check and the record (checker round 4).
-        if (await bb.storage.kv.get<DeviceProof>(key) === undefined || ownerAsks.get(askId)?.state !== "answered") {
-          bb.log.info(`device proof ${askId}: card closed while its tap was read; no proof recorded`);
-          await dropDeviceProof(askId);
+        const current = deliveries.get(proof.pr);
+        if (current?.forgeState === "merged") {
+          const cardHead = fullCommitSha(proof.head), nowHead = fullCommitSha(current.headSha), mergeSha = fullCommitSha(current.mergeCommitSha);
+          if (!cardHead || !nowHead || cardHead !== nowHead) return refusePermanent("The device card does not cover the PR's final head.");
+          if (!mergeSha) return retryTree(false);
+          const hostId = await resolveHostForProject(current.projectId, current.owner ?? undefined);
+          const compared = await compareOwnerTapTrees(hostId, current.repository, cardHead, mergeSha);
+          if (!compared.ok) {
+            if (!compared.temporary) return refusePermanent(compared.reason);
+            return retryTree(!/cooling down|held back: hourly allowance|GraphQL reserve/i.test(compared.reason));
+          }
+          // After every host and tree read: re-read the binding, then check state, answer
+          // sequence, Works, and delivery identity with no await before the write.
+          const liveProof = await bb.storage.kv.get<DeviceProof>(key);
+          const liveAsk = ownerAsks.get(askId);
+          const live = deliveries.get(proof.pr);
+          if (liveProof === undefined || liveAsk?.state !== "answered") {
+            bb.log.info(`device proof ${askId}: card closed while its tap was read; no proof recorded`);
+            return { status: "completed" };
+          }
+          if ((liveAsk.resolution ?? "").trim().toLowerCase() !== "works" || laterOwnerAnswer(askId, answerSeq)) return { status: "completed" };
+          if (fullCommitSha(live?.headSha) !== nowHead || fullCommitSha(live?.mergeCommitSha) !== mergeSha) return { status: "completed" };
+          deliveries.verify(proof.pr, OWNER_ACTOR, mergeSha, { ...evidence, tappedCommitSha: cardHead, treeSha: compared.treeSha });
+          await bb.storage.kv.delete(key);
+          const note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${mergeSha.slice(0, 7)}.`;
+          bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
+          await tell(note);
           return { status: "completed" };
         }
-        const current = deliveries.get(proof.pr);
-        if (current?.forgeState === "merged" && current.headSha !== proof.head) throw new Error("The device card does not cover the PR's final head.");
-        const commit = current?.forgeState === "merged" ? current.mergeCommitSha ?? proof.head : proof.head;
-        deliveries.verify(proof.pr, OWNER_ACTOR, commit, { driven: `the owner tested build ${proof.build} on ${surfaceWords(proof.surface as never)}`, seen: "Works", surface: proof.surface, build: proof.build });
-        note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${commit.slice(0, 7)}.`;
+        const liveProof = await bb.storage.kv.get<DeviceProof>(key);
+        const liveAsk = ownerAsks.get(askId);
+        if (liveProof === undefined || liveAsk?.state !== "answered") {
+          bb.log.info(`device proof ${askId}: card closed while its tap was read; no proof recorded`);
+          return { status: "completed" };
+        }
+        if ((liveAsk.resolution ?? "").trim().toLowerCase() !== "works" || laterOwnerAnswer(askId, answerSeq)) return { status: "completed" };
+        deliveries.verify(proof.pr, OWNER_ACTOR, proof.head, evidence);
+        await bb.storage.kv.delete(key);
+        const note = `The owner tapped Works for build ${proof.build}: proof is recorded for ${proof.pr} at ${proof.head.slice(0, 7)}.`;
+        bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
+        await tell(note);
+        return { status: "completed" };
       } catch (error) {
-        note = `The owner tapped Works for build ${proof.build}, but no proof was recorded for ${proof.pr}: ${error instanceof Error ? error.message : String(error)} Open a new device proof card for the current head.`;
+        if (error instanceof GithubReservePaused) return retryTree(false);
+        const message = error instanceof Error ? error.message : String(error);
+        if (/cooling down|held back: hourly allowance|GraphQL reserve/i.test(message)) return retryTree(false);
+        if (/did not return (a )?trees?|unreadable|Timed out/i.test(message)) return retryTree(true);
+        return refusePermanent(message);
       }
-      await bb.storage.kv.delete(key);
-      bb.log.info(`device proof ${askId} ${proof.pr}@${proof.head.slice(0, 7)} build=${proof.build}: works`);
-      await tell(note);
-      return { status: "completed" };
     }
     if (ask?.sourceRef?.startsWith("crew-wait:") && resolution) {
       const sentKey = `owner-answer-sent:${ask.id}:${answerSeq}`;
@@ -10108,7 +10474,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   function applyFollowUpResult(job: AskFollowUp, result: FollowUpResult): void {
     if (result.status === "completed") ownerAsks.markFollowUpDone(job.askId, job.effect, job.answerSeq);
-    else if (result.error === "waiting for owner tap confirmation") ownerAsks.recordFollowUpError(job.askId, job.effect, result.error, job.answerSeq);
+    else if (result.error === "waiting for owner tap confirmation" || result.error === "waiting for github allowance") ownerAsks.recordFollowUpError(job.askId, job.effect, result.error, job.answerSeq);
     else {
       ownerAsks.failFollowUp(job.askId, job.effect, result.error, undefined, job.answerSeq);
       bb.log.warn(`ask follow-up ${job.askId} ${job.effect}: ${result.error}`);
@@ -10582,31 +10948,322 @@ export default async function plugin(bb: BbPluginApi) {
   async function requireProductionApproval(pr: MergeTarget, crew: Crew, hostId: string | null): Promise<void> {
     if (pr.state === "merged") return;
     const key = prKeyOf(pr.url) ?? "";
-    for (const binding of productionApprovals.candidates(key)) {
-      const ask = ownerAsks.get(binding.ask);
-      if (!ask || ask.captain !== crew.parentThreadId) continue;
-      if (ask.kind !== "approval" || ask.state !== "answered" || !ownerAsks.answeredByOwner(ask.id) || !affirmative(ask)) break;
-      if (pr.headSha !== "" && binding.head === pr.headSha) return;
-      if (hostId === null || !pr.headSha) break;
-      try {
-        const repo = key.split("#")[0]!;
-        const number = key.split("#")[1]!;
-        const read = async (path: string) => {
-          const result = await runStructuredOnHost(hostId, `gh api ${shQuote(path)}`, 30_000);
-          if (result.exitCode !== 0) throw new Error("Cannot read approval ancestry");
-          return JSON.parse(result.output);
-        };
-        const comparison = compareSchema.parse(await read(`repos/${repo}/compare/${binding.head}...${pr.headSha}`));
-        const base = z.object({head:z.object({sha:z.string()}),base:z.object({sha:z.string()})}).parse(await read(`repos/${repo}/pulls/${number}`));
-        if (base.head.sha !== pr.headSha) break;
-        if (await onlyBaseMerges(binding.head, pr.headSha, comparison, async (sha) => {
-          const relation = compareSchema.parse(await read(`repos/${repo}/compare/${sha}...${base.base.sha}`));
-          return relation.status === "ahead" || relation.status === "identical";
-        })) return;
-      } catch { /* Missing or incomplete ancestry requires a new card. */ }
-      break;
+    const picked = pickTaskForPr(openTasksForPr(key, crew.parentThreadId), crew.id);
+    if (picked.unclear) throw new Error(`Refusing: ${key} is on more than one open task; nothing was merged.`);
+    const task = picked.task;
+    if (task && key && !task.prs.some((named) => named.toLowerCase() === key.toLowerCase())) {
+      throw new Error(`Refusing: ${key} is not work of task ${task.id}; nothing was merged.`);
     }
+    const cards = ownerGate.cardsForPr(key);
+    const coverage = await cardCoverage(hostId, key, pr.headSha, cards);
+    const status = approvalFor({
+      pr: key, head: pr.headSha, action: "merge", cards, coverage,
+      preApprovals: coveringPres(task), task: task?.id, taskOpen: task ? !isFinishedTask(task) : false,
+      generation: task ? taskOpenEpoch(task) : undefined,
+      captain: task?.captain ?? crew.parentThreadId ?? undefined,
+    });
+    if (status.state === "success") return;
     throw new Error(`Refusing: ${key} needs an owner approval card for its current changes; nothing was merged. Send firstmate_ask kind=approval with structured prs naming ${key}, what changes, where it goes live, how to undo, and screenshots for visible changes. Pass prs=["${key}"] and omit options and recommended. Wait for the owner's Approve answer. New author commits need a new card; --yes and standing approvals do not count.`);
+  }
+
+  async function cardCoverage(hostId: string | null, pr: string, head: string, cards: readonly GateCard[]): Promise<(card: GateCard) => HeadCoverage> {
+    const unique = [...new Set(cards.map((card) => card.head))];
+    const map = new Map<string, HeadCoverage>();
+    await Promise.all(unique.map(async (approved) => {
+      map.set(approved, await headCoverage(hostId, pr, approved, head));
+    }));
+    return (card) => map.get(card.head) ?? (card.head === head ? "covers" : "unknown");
+  }
+
+  async function headCoverage(hostId: string | null, pr: string, approved: string, head: string): Promise<HeadCoverage> {
+    if (head === "" || approved === "") return "unknown";
+    if (head === approved) return "covers";
+    if (hostId === null) return "unknown";
+    try {
+      const repo = pr.split("#")[0]!;
+      const number = pr.split("#")[1]!;
+      const read = async (path: string) => {
+        // A background pass pays each read from the shared allowance; explicit requests are not charged.
+        if (!reserveGithub(hostId, false, 1, true)) throw new GithubReservePaused(hostId);
+        const result = await runStructuredOnHost(hostId, `gh api ${shQuote(path)}`, 30_000);
+        if (result.exitCode !== 0) throw new Error("Cannot read approval ancestry");
+        return JSON.parse(result.output);
+      };
+      const comparison = compareSchema.parse(await read(`repos/${repo}/compare/${approved}...${head}`));
+      const base = z.object({ head: z.object({ sha: z.string() }), base: z.object({ sha: z.string() }) }).parse(await read(`repos/${repo}/pulls/${number}`));
+      if (base.head.sha !== head) return "unknown";
+      if (await onlyBaseMerges(approved, head, comparison, async (sha) => {
+        const relation = compareSchema.parse(await read(`repos/${repo}/compare/${sha}...${base.base.sha}`));
+        return relation.status === "ahead" || relation.status === "identical";
+      })) return "covers";
+      return "new-author";
+    } catch (error) {
+      if (error instanceof GithubReservePaused) throw error;
+      return "unknown";
+    }
+  }
+
+  async function gateHost(projectId?: string | null, captain?: string | null): Promise<string | null> {
+    const set = String((await settings.get()).fmHostId ?? "").trim();
+    if (set !== "") return set;
+    if (projectId) {
+      try {
+        const hostId = await resolveHostForProject(projectId, captain ?? undefined);
+        if (hostId) return hostId;
+      } catch { /* fall through */ }
+    }
+    return fleetHost();
+  }
+
+  function coveringPres(task?: OwnerTask | null): PreApproval[] {
+    if (!task) return [];
+    if (isOpenTask(task)) {
+      const epoch = taskOpenEpoch(task);
+      for (const row of ownerGate.listPreApprovals("")) {
+        if (!task.sourceRefs.includes(row.ownerMessageRef)) continue;
+        if (!ownerGate.bindPreApproval(row.id, task.id, epoch)) continue;
+        for (const named of task.prs) {
+          const head = deliveries.get(named)?.headSha ?? "";
+          if (head) ownerGate.needStatusPost(named, head, "pre-approval bound", Date.now());
+        }
+      }
+    }
+    return ownerGate.listPreApprovals(task.id);
+  }
+
+  function openTasksForPr(pr: string, captain?: string | null): OwnerTask[] {
+    const captains = captain ? [captain] : [...knownCaptainsRef];
+    const hits: OwnerTask[] = [];
+    const needle = pr.toLowerCase();
+    for (const id of captains) {
+      for (const task of ownerTasks.list(id)) {
+        if (task.prs.some((named) => named.toLowerCase() === needle)) hits.push(task);
+      }
+    }
+    return hits;
+  }
+
+  function pickTaskForPr(hits: readonly OwnerTask[], crewId?: string | null): { task?: OwnerTask; unclear: boolean } {
+    if (hits.length === 0) return { unclear: false };
+    if (crewId) {
+      const owned = hits.filter((task) => task.crewIds.includes(crewId));
+      if (owned.length === 1) return { task: owned[0], unclear: false };
+      if (owned.length > 1) return { unclear: true };
+      if (hits.length === 1) return { task: hits[0], unclear: false };
+      return { unclear: true };
+    }
+    if (hits.length === 1) return { task: hits[0], unclear: false };
+    return { unclear: true };
+  }
+
+  function taskForPr(pr: string, captain?: string | null, crewId?: string | null): OwnerTask | undefined {
+    return pickTaskForPr(openTasksForPr(pr, captain), crewId).task;
+  }
+
+  async function refreshApprovalForTask(task: OwnerTask): Promise<void> {
+    coveringPres(task);
+    const hostId = await gateHost(task.projectId, task.captain);
+    for (const named of task.prs) {
+      const head = deliveries.get(named)?.headSha ?? "";
+      if (head) await syncOwnerApprovalStatus(named, head, hostId, task);
+    }
+  }
+
+  function parseProdPr(raw?: string): string | undefined {
+    if (!raw?.trim()) return undefined;
+    const trimmed = raw.trim();
+    if (/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(trimmed)) return trimmed.toLowerCase();
+    try { return canonicalPr(trimmed).id; } catch { return undefined; }
+  }
+
+  async function syncOwnerApprovalStatus(pr: string, head: string, hostId: string | null, task?: OwnerTask | null): Promise<void> {
+    if (!pr || !head) return;
+    // A background pass pays every approval read and the post from the shared GitHub allowance.
+    // A refused request defers the whole sync: the post stays saved with its last error, and no
+    // failure is recorded. Explicit requests are not charged.
+    const defer = () => ownerGate.queueStatusPost(pr, head, Date.now());
+    const found = task ?? taskForPr(pr);
+    const cards = ownerGate.cardsForPr(pr);
+    let coverage: Awaited<ReturnType<typeof cardCoverage>>;
+    try { coverage = await cardCoverage(hostId, pr, head, cards); }
+    catch (error) {
+      if (!(error instanceof GithubReservePaused)) throw error;
+      defer();
+      return;
+    }
+    const status = approvalFor({
+      pr, head, action: "merge", cards, coverage, preApprovals: coveringPres(found),
+      task: found?.id, taskOpen: found ? !isFinishedTask(found) : false,
+      generation: found ? taskOpenEpoch(found) : undefined,
+      captain: found?.captain,
+    });
+    const repo = pr.split("#")[0]!;
+    const fail = (message: string) => {
+      ownerGate.needStatusPost(pr, head, message, Date.now());
+      bb.log.warn(`owner approval status ${pr}@${head.slice(0, 7)}: ${message}`);
+      void repairNotice(`owner-approval-status:${pr}:${head}`, `Firstmate: Owner approval status for ${pr} failed (${clip(message, 200)}).`);
+    };
+    try {
+      const postedHost = hostId ?? await gateHost(found?.projectId, found?.captain);
+      if (!postedHost) {
+        fail("no host");
+        return;
+      }
+      if (!reserveGithub(postedHost, false, 1, true)) {
+        defer();
+        return;
+      }
+      const posted = await runStructuredOnHost(postedHost, postStatusCommand(repo, head, status), 30_000);
+      if (posted.exitCode !== 0) throw new Error(posted.stderr || posted.output || `status exit ${posted.exitCode}`);
+      ownerGate.clearStatusPost(pr, head);
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  // A saved status post, sent from the background drain or an explicit reconcile of a finished delivery.
+  async function retryOwnerApprovalStatus(pr: string, head: string): Promise<void> {
+    const record = deliveries.get(pr);
+    const task = taskForPr(pr, record?.owner, record?.taskId);
+    const hostId = await gateHost(task?.projectId ?? record?.projectId, record?.owner ?? task?.captain);
+    await syncOwnerApprovalStatus(pr, head, hostId, task);
+  }
+
+  async function syncOwnerApprovalForAsk(askId: string): Promise<void> {
+    const ask = ownerAsks.get(askId);
+    for (const { pr, head } of ownerGate.targetsForAsk(askId)) {
+      const task = (ask?.task ? ownerTasks.get(ask.task) : undefined) ?? taskForPr(pr, ask?.captain);
+      const currentHead = deliveries.get(pr)?.headSha || head;
+      const hostId = await gateHost(task?.projectId ?? deliveries.get(pr)?.projectId, ask?.captain);
+      await syncOwnerApprovalStatus(pr, currentHead, hostId, task);
+    }
+  }
+
+  async function checkProdTarget(input: { project: string; what: ProdWhat; task?: OwnerTask; pr?: string; captain?: string }): Promise<{ ok: boolean; reason: string }> {
+    const head = input.pr ? (deliveries.get(input.pr)?.headSha ?? "") : "";
+    const cards = input.pr ? ownerGate.cardsForPr(input.pr) : [];
+    const hostId = input.pr ? await gateHost(input.task?.projectId, input.captain ?? input.task?.captain) : null;
+    const coverage = input.pr ? await cardCoverage(hostId, input.pr, head, cards) : undefined;
+    return prodCheck({
+      project: input.project, what: input.what, task: input.task?.id, pr: input.pr, head,
+      cards, coverage,
+      preApprovals: coveringPres(input.task),
+      taskOpen: input.task ? !isFinishedTask(input.task) : false,
+      generation: input.task ? taskOpenEpoch(input.task) : undefined,
+      taskPrs: input.task?.prs,
+      captain: input.captain ?? input.task?.captain,
+    });
+  }
+
+  async function runProdCheck(input: { project: string; what: ProdWhat; task?: string; pr?: string; threadId?: string }): Promise<{ ok: boolean; reason: string }> {
+    const crew = input.threadId ? await findCrewByThread(input.threadId) : undefined;
+    const captain = crew?.parentThreadId ?? input.threadId;
+    const pr = input.pr ? parseProdPr(input.pr) : undefined;
+    if (input.pr && !pr) return { ok: false, reason: `Refusing: ${input.pr} is not owner/repo#N or a GitHub PR URL.` };
+    const named = input.task && captain ? ownerTasks.get(input.task) : undefined;
+    if (input.task && (!named || named.captain !== captain)) return { ok: false, reason: `Refusing: no owner task ${input.task} for this captain.` };
+    const task = named ?? (pr && captain ? taskForPr(pr, captain) : undefined);
+    if (named && pr && !named.prs.some((item) => item.toLowerCase() === pr)) {
+      return { ok: false, reason: `Refusing: ${pr} is not work of task ${named.id}.` };
+    }
+    const targets = pr ? [pr] : (task?.prs ?? []);
+    if (targets.length === 0) return await checkProdTarget({ project: input.project, what: input.what, task, captain });
+    let last = { ok: true, reason: "" };
+    for (const id of targets) {
+      last = await checkProdTarget({ project: input.project, what: input.what, task, pr: id, captain });
+      if (!last.ok) return last;
+    }
+    return last;
+  }
+
+  async function sightDeploy(input: { project: string; task?: string; source: string; detail: string }): Promise<boolean> {
+    const task = input.task ? ownerTasks.get(input.task) : undefined;
+    const targets = task?.prs ?? [];
+    let result = targets.length === 0
+      ? await checkProdTarget({ project: input.project, what: "deploy", task, captain: task?.captain })
+      : { ok: true, reason: "" };
+    for (const id of targets) {
+      result = await checkProdTarget({ project: input.project, what: "deploy", task, pr: id, captain: task?.captain });
+      if (!result.ok) break;
+    }
+    ownerGate.recordDeploy({ project: input.project, task: input.task, source: input.source, detail: input.detail, approved: result.ok, at: Date.now() });
+    if (!result.ok) {
+      void repairNotice(`unapproved-deploy:${input.project}:${input.task ?? ""}`, `Firstmate: ${input.project} went live without owner approval (${clip(input.detail, 200)}).`);
+    }
+    return result.ok;
+  }
+
+  async function considerOwnerPreApproval(
+    captain: string,
+    text: string,
+    dispatch: {
+      initiator: unknown;
+      senderThreadId: unknown;
+      origin: unknown;
+      originPluginId: unknown;
+      submissionPluginId: unknown;
+      submissionData: unknown;
+    },
+  ): Promise<void> {
+    const source = ownerDispatchSource(dispatch);
+    if (source === null) return;
+    const telegram = (dispatch.submissionPluginId === "telegram" ? parseTelegramSubmission(dispatch.submissionData) : null) ?? parseInboundTelegram(text);
+    const header = parseConnectorHeader(text);
+    const sourceEventId = telegram?.sourceEventId ?? header?.sourceEventId;
+    if (sourceEventId && /^(ask|pack|proof):/i.test(sourceEventId)) return;
+    if (telegram?.forwarded === true || header?.forwarded === true) return;
+    const messageId = telegram?.messageId ?? header?.messageId;
+    const senderId = telegram?.senderId ?? header?.senderId;
+    if (!messageId || !senderId) return;
+    const body = stripTelegramEnvelope(text);
+    if (body === "" || isBotOrAckText(text)) return;
+    if (ownerAsks.listOpen(captain).some((ask) => askLetterAnswer(ask, body) !== null)) return;
+    const ref = telegram ? telegramSourceRef(telegram) : header ? telegramSourceRef(header) : "";
+    if (ref !== "" && ownerGate.listPreApprovals().some((row) => row.ownerMessageRef === ref)) return;
+    const keyFile = String((await settings.get()).decisionsKeyFile ?? "").trim();
+    let apiKey = "";
+    if (keyFile !== "") {
+      try { apiKey = keyFromEnvFile(readFileSync(keyFile, "utf8")); } catch (error) {
+        bb.log.warn(`pre-approval judge skipped: Decisions key file unreadable (${error instanceof Error ? error.message : String(error)})`);
+        return;
+      }
+    }
+    const projectName = telegram?.project?.name?.trim() || header?.project?.name?.trim() || "";
+    const open = ownerTasks.list(captain);
+    const candidates = projectName ? open.filter((task) => sameProject(task.project, projectName)) : open;
+    const judgment = await judgePreApprovalBound(body, {
+      apiKey,
+      tasks: candidates.map((task) => ({ id: task.id, title: task.title, project: task.project ?? "" })),
+    });
+    if (judgment.allows === "neither") return;
+    const byRef = ref ? ownerTasks.openByRef(captain, ref)[0] : undefined;
+    const named = candidates.find((task) => task.id === judgment.task);
+    const task = byRef ?? named;
+    const pre = ownerGate.recordPreApproval({
+      ownerMessageRef: ref, quote: clip(body, 4000), task: task?.id ?? "",
+      generation: task ? taskOpenEpoch(task) : 0,
+      project: task?.project ?? projectName, allows: judgment.allows, createdAt: Date.now(),
+    });
+    const quoted = quotePreApproval(pre);
+    if (telegram && (await reliabilityFlags()).telegramThreading === "on") {
+      await sendTelegramReply({
+        payload: {
+          chatId: telegram.chatId, messageId: telegram.messageId, kind: "progress", text: quoted,
+          threadId: telegram.threadId, quote: clip(body, 200),
+          ...(pre.project ? { project: pre.project } : {}),
+          ...(pre.task ? { task: pre.task } : {}),
+        },
+        callRpc: (args) => bb.sdk.plugins.callRpc(args),
+      }).catch((error) => bb.log.warn(`pre-approval quote: ${String(error)}`));
+    }
+    bb.log.info(`pre-approval ${pre.id} ${pre.allows} ${pre.task || "unbound"}: ${clip(body, 80)}`);
+    if (task?.prs.length) {
+      const hostId = await gateHost(task.projectId, captain);
+      for (const pr of task.prs) {
+        const head = deliveries.get(pr)?.headSha ?? "";
+        if (head) await syncOwnerApprovalStatus(pr, head, hostId, task);
+      }
+    }
   }
 
   async function mergeCrew(
@@ -11668,7 +12325,7 @@ export default async function plugin(bb: BbPluginApi) {
     command: string,
     timeoutMs: number,
     signal?: AbortSignal,
-  ): Promise<{ exitCode: number | null; output: string }> {
+  ): Promise<{ exitCode: number | null; output: string; fromMarker?: boolean }> {
     signal?.throwIfAborted();
     // Capture only the cleanup callback while the plugin context is live. A late
     // create reply must still be closed after disposal invalidates bb.sdk access.
@@ -11725,10 +12382,10 @@ export default async function plugin(bb: BbPluginApi) {
           );
         }
         const parsed = parseHostRc(output);
-        if (parsed !== null) return parsed;
+        if (parsed !== null) return { ...parsed, fromMarker: true };
         if (status === "exited" && outputRead) {
           const exitCode = asRecord(cur)["exitCode"];
-          return { exitCode: typeof exitCode === "number" ? exitCode : 1, output: stripAnsi(output) };
+          return { exitCode: typeof exitCode === "number" ? exitCode : null, output: stripAnsi(output), fromMarker: false };
         }
         await sleep(250);
       }
@@ -11755,7 +12412,7 @@ export default async function plugin(bb: BbPluginApi) {
     timeoutMs: number,
     signal?: AbortSignal,
     stdin?: string,
-  ): Promise<{ exitCode: number | null; output: string }> {
+  ): Promise<{ exitCode: number | null; output: string; fromMarker?: boolean }> {
     if (stdin === undefined) return runHostCommand(hostId, command, timeoutMs, signal);
     const tmp = `/tmp/.fm-stdin-${randomUUID()}`;
     if (!(await writeHostBytes(hostId, tmp, stdin, timeoutMs, signal))) {
@@ -12252,7 +12909,7 @@ export default async function plugin(bb: BbPluginApi) {
     receipt?: { action: "receive" | "inspect" | "begin-action" | "mark-success" | "complete" | "complete-hidden" | "legacy-ack"; id?: string };
     // The caller already ran the away-return checks for this start.
     returnChecked?: boolean;
-  }): Promise<{ exitCode: number | null; output: string; scriptPath: string; receipt?: WakeReceipt }> {
+  }): Promise<{ exitCode: number | null; output: string; scriptPath: string; receipt?: WakeReceipt; fromMarker?: boolean }> {
     const script = normalizeFmScript(input.script);
     if (script === "spawn" && input.returnChecked !== true) await reconcileReturnedAfk(input.parentThreadId);
     if (["spawn", "pr-merge", "merge-local"].includes(script) && input.returnChecked !== true) await guardReturnCatchup(input.hostId, input.fmHome);
@@ -14514,6 +15171,7 @@ export default async function plugin(bb: BbPluginApi) {
     dispatchHelp,
     "  bb firstmate launches list [--limit n] [--offset n] [--json]   # uncertain slots require reconciliation",
     "  bb firstmate launches adopt <task-id> --thread <thread-id> [--check] [--json]   # exact legacy registration repair; no turn or merge",
+    "  bb firstmate launches release <task-id>   # free an uncertain slot that never requested a worker",
     "  bb firstmate deliveries list|inspect|register|reconcile|assign|abandon|clear-hold [id] [--from manager] [--reason evidence] [--authorized]",
     '  bb firstmate deliveries verify <id> --commit <head sha> --driven "<what you drove>" --seen "<what you saw>"   # a crew that drove it may record it',
     "  bb firstmate prs [--json]   # read-only: open PRs by this GitHub account in your projects, untracked ones first",
@@ -14523,6 +15181,7 @@ export default async function plugin(bb: BbPluginApi) {
     '  bb firstmate tell <id> [--queue] -- "<message>" | interrupt <id> | stop <id> | retry <id> [--model m] [--provider p] [--reasoning-level l] [--intent failure-recovery|execution-change] [--reason r]',
     "  bb firstmate scout-report <id> [--json]   # complete owned promotion artifact",
     "  bb firstmate bearings | deliver <id> | merge <id> [--pr <number|url>] [--yes] [--allow-red <check-name>] [--allow-missing <check-name>] [--allow-unverified <owner words>] | promote <id>",
+    "  bb firstmate prod-check <project> <merge|deploy> [--task T<n>] [--pr owner/repo#N]   # crews: exits non-zero without owner approval or pre-approval",
     "  bb firstmate handoff --from <previous-captain-thread> [--crew <id>]",
     '  bb firstmate queue reconcile <id> --project <id> [--title <original> --detail <full> --mode <mode> --delivery-requirement <contract> --provider <id> --model <id> --reasoning-level <level> --after <id> --wait-until <iso>]',
     queueHelp,
@@ -14870,6 +15529,7 @@ export default async function plugin(bb: BbPluginApi) {
           const joinRefs = origin !== undefined ? [] : passedRefs.length > 0 ? passedRefs : turnRefs.length === 1 ? turnRefs : [];
           const joined = ownerTasks.attach(held.id, parentThreadId, { crewId, sourceRefs: joinRefs, project: { id: resolvedProject, label: await projectLabel(resolvedProject) }, at: Date.now() });
           quality.noteTaskCrew({ captain: parentThreadId, task: joined.id, title: joined.title, crew: crewId, role: role ?? "builder", shape: shape ?? "ship", at: Date.now() });
+          await refreshApprovalForTask(joined);
           await refreshOwnerBoard();
           return ` Owner task ${joined.id} (${joined.state}) tracks it; no new task was opened.`;
         }
@@ -14880,6 +15540,7 @@ export default async function plugin(bb: BbPluginApi) {
           sourceRefs: openRefs, crewId, at: Date.now(),
         });
         quality.noteTaskCrew({ captain: parentThreadId, task: opened.id, title: opened.title, crew: crewId, role: role ?? "builder", shape: shape ?? "ship", at: Date.now() });
+        await refreshApprovalForTask(opened);
         await refreshOwnerBoard();
         const linkNote = !untagged ? "" : openRefs.length > 0
           ? ` It is linked to this turn's owner message ${openRefs[0]}; pass sourceRefs, taskRef or origin to say otherwise.`
@@ -15021,12 +15682,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_ask",
-    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. Approval cards supply fixed Approve and No buttons: omit options and recommended, and pass the exact authorized PR list in prs; question-text PR mentions grant no permission. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one. bind=crewId or crewId:key attaches the card to a native crew question so the owner's answer or Close releases that hold.",
+    description: "Ask the captain one question, blocker or approval as a Telegram card with up to 4 option buttons. It stays on the captain's board until answered. Returns at once: keep working on other things. The answer arrives from a button tap or a card reply containing just its option letter. Reversible cards sent within a minute of each other share one Telegram message with an \"Accept all recommended\" button; an answer there arrives as one owner message with a line \"- ask <id>: <option>\" per card it answered. Approval cards supply fixed Approve and No buttons: omit options and recommended, and pass the exact authorized PR list in prs; question-text PR mentions grant no permission. irreversible=true or kind=approval never proceeds on a deadline and keeps its own message; a reversible ask with a recommended option proceeds with it at its deadline. A grilling question batch is one round: pass round with 2 to 12 questions (each with 2 to 4 options and recommended); it is one Telegram message with no buttons. Single decisions, blockers and approvals stay one question per card. A card names its project. A card the owner's rules in captain.md already answer is refused with the rule. A new card on the same task and subject replaces the open one. bind=crewId or crewId:key attaches the card to a native crew question so the owner's answer or Close releases that hold.",
     parameters: z.object({
       impact: z.string().optional().describe("Optional. One plain sentence explaining what this means for the owner’s business"),
-      question: z.string().min(1).max(1500).describe("One question, asked in the first sentence; put option text in options, not in the question. Cards sent together that start with the same subject and a colon (\"DM Pro plugin: ...\") get that subject as their shared title"),
+      question: z.string().min(1).max(1500).optional().describe("One question, asked in the first sentence; put option text in options, not in the question. Required unless round is set, when it is an optional title. Cards sent together that start with the same subject and a colon (\"DM Pro plugin: ...\") get that subject as their shared title"),
       kind: z.enum(["question", "blocker", "approval"]),
       options: z.array(z.object({ label: z.string().min(1).max(1000).describe("Questions and blockers only; approval cards use fixed Approve and No buttons"), value: z.string().min(1).max(64).optional() })).max(4).optional(),
+      round: z.array(z.object({
+        question: z.string().min(1).max(500),
+        options: z.array(z.object({ label: z.string().min(1).max(1000), value: z.string().min(1).max(64).optional() })).min(2).max(4),
+        recommended: z.number().int().min(0),
+      })).min(2).max(12).optional().describe("A grilling question batch: 2 to 12 questions in one Telegram message, no buttons. Kind must be question and reversible"),
       prs: z.array(z.string().max(200).regex(/^[\w.-]+\/[\w.-]+#[1-9]\d*$/)).max(20).optional().describe("Approval only: the exact PRs authorized by this card, as owner/repo#N. The plugin displays this list. PR mentions in question text grant no permission"),
       recommended: z.number().int().min(0).optional().describe("Index of the recommended option"),
       defaultAfterMinutes: z.number().min(5).max(10080).optional().describe("Proceed with the recommended option after this many minutes without an answer (reversible asks only)"),
@@ -15036,7 +15702,7 @@ export default async function plugin(bb: BbPluginApi) {
       task: z.string().regex(/^T\d+$/).optional().describe("The owner task this card is for (T<n>). Unset: the open task the owner message of this turn started. In Telegram the card replies to the task's status line, which counts it"),
       bind: z.string().min(1).max(120).optional().describe("Bind this card to a native crew question so the owner's answer or Close releases that hold. Pass the crew id, or crewId:key of the status decision."),
     }),
-    async execute({ impact, question, kind, options, prs, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId, bind }, ctx) {
+    async execute({ impact, question, kind, options, round, prs, recommended, defaultAfterMinutes, irreversible, startsNewWork, project, task: taskId, bind }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_ask runs only in a captain thread.");
       if (taskId !== undefined && ownerTasks.get(taskId)?.captain !== captain) return toolError(`No owner task ${taskId} for this captain. Check firstmate_task list.`);
@@ -15046,6 +15712,54 @@ export default async function plugin(bb: BbPluginApi) {
       // Owner decision Q7: every card names its project (32 of 95 cards on 15-17 Oct had none).
       const cardProject = project?.trim() || (cardTask !== undefined ? ownerTasks.get(cardTask)?.project ?? undefined : undefined);
       if (!cardProject) return toolError("Refusing: a card names its project. Pass project (as on the board, such as Safi), or task (T<n>) of a task that has one. Nothing was sent.");
+      if (round !== undefined) {
+        if (kind !== "question") return toolError("Refusing: a grilling round is a reversible question, never an approval or blocker. Nothing was sent.");
+        if (irreversible === true) return toolError("Refusing: a grilling round must be reversible. Nothing was sent.");
+        if (defaultAfterMinutes !== undefined) return toolError("Refusing: a grilling round has no deadline. Remove defaultAfterMinutes. Nothing was sent.");
+        if (startsNewWork === true) return toolError("Refusing: a grilling round does not start new work. Nothing was sent.");
+        if (bind !== undefined) return toolError("Refusing: a grilling round cannot bind a crew question. Nothing was sent.");
+        if (options !== undefined) return toolError("Refusing: omit options when sending a round. Put each question's options on that round item. Nothing was sent.");
+        if (recommended !== undefined) return toolError("Refusing: omit recommended when sending a round. Put recommended on each round item. Nothing was sent.");
+        if (prs !== undefined) return toolError("Refusing: prs belongs only to an approval card. Nothing was sent.");
+        const roundQuestions = round.map((item) => ({
+          question: item.question.trim(),
+          options: item.options.map((option, index) => ({ label: option.label, value: option.value ?? String.fromCharCode(65 + index) })),
+          recommended: item.recommended,
+        }));
+        for (const [index, item] of roundQuestions.entries()) {
+          if (item.recommended >= item.options.length) {
+            return toolError(`Refusing: round question ${index + 1} recommended must be the index of one of its options. Nothing was sent.`);
+          }
+        }
+        const title = question?.trim() ?? "";
+        const storedText = title || roundQuestions[0]!.question;
+        const roundImpact = impact?.replace(/\s+/g, " ").trim();
+        const formatted = formatAskRound({ text: storedText, ...(roundImpact ? { impact: roundImpact } : {}), round: roundQuestions });
+        if (formatted.length > ASK_ROUND_MAX_CHARS) {
+          return toolError("Refusing: the grilling round is longer than one Telegram message (3000 characters). Shorten the questions. Nothing was sent.");
+        }
+        const answeredRound = await ruleAnswering(captain, formatted);
+        if (answeredRound !== null) return toolError(`Refusing: the owner's rules already answer this card, so it was not sent. Rule: "${answeredRound}". Act on it and say in one line what you did.`);
+        const nowRound = Date.now();
+        const roundAsk = ownerAsks.create({
+          captain, kind: "question", ...(roundImpact ? { impact: roundImpact } : {}), text: storedText,
+          options: [], round: roundQuestions, recommended: null, defaultAt: null,
+          irreversible: false, startsNewWork: false, createdAt: nowRound,
+          project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}),
+          subject: (title || roundQuestions[0]!.question).slice(0, 60).toLowerCase(),
+        });
+        const replacedRound = await replaceOpenCards(roundAsk);
+        const roundDone = `Ask ${roundAsk.id} is open and on the captain's board.${replacedRound.length > 0 ? ` It replaces card ${replacedRound.join(", ")}, now marked replaced.` : ""} Keep working on other things; the answer arrives as an owner message that replies to ask ${roundAsk.id}.`;
+        if ((await reliabilityFlags()).telegramThreading !== "on") {
+          return `${roundDone}\nWarning: not sent to Telegram because telegramThreading is off. Put the question in your final message too.`;
+        }
+        const roundWarning = await sendAskCard(roundAsk, { project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}) });
+        await refreshOwnerBoard();
+        return roundWarning === ""
+          ? `Question card ${roundAsk.id} sent. ${roundDone}`
+          : `${roundDone}\nWarning: the question card was not sent to Telegram (${roundWarning}). The ask stays open on the board; put the question in your final message too.`;
+      }
+      if (question === undefined) return toolError("Refusing: a question card needs a question. Nothing was sent.");
       const answered = kind === "approval" ? null : await ruleAnswering(captain, [question, impact ?? "", ...(options ?? []).map((option, index) => `${String.fromCharCode(65 + index)}. ${option.label}`)].filter(Boolean).join("\n"));
       if (answered !== null) return toolError(`Refusing: the owner's rules already answer this card, so it was not sent. Rule: "${answered}". Act on it and say in one line what you did.`);
       if (kind === "approval" && ((options !== undefined && !fixedApprovalChoices(options)) || recommended !== undefined)) {
@@ -15093,7 +15807,10 @@ export default async function plugin(bb: BbPluginApi) {
         project: cardProject, ...(cardTask !== undefined ? { task: cardTask } : {}), subject: cardSubject(question),
         ...(sourceRef !== undefined ? { sourceRef } : {}),
       });
-      if (kind === "approval") productionApprovals.bindCard(ask.id, approvalHeads);
+      if (kind === "approval") {
+        productionApprovals.bindCard(ask.id, approvalHeads);
+        await syncOwnerApprovalForAsk(ask.id);
+      }
       const replaced = await replaceOpenCards(ask);
       const deadline = ask.defaultAt !== null
         ? ` If no answer by ${formatUtcTime(ask.defaultAt)}, it proceeds with "${recommendedLabel(ask)}" and you are told to go ahead.`
@@ -15112,38 +15829,60 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_resolve_ask",
-    description: "Correct or close an ask from firstmate_ask, or reopen it with reopen=true, when you learn the answer another way (resolution = the answer), or cancel it when it no longer matters (cancelled=true).",
+    description: "Correct or close an ask from firstmate_ask, or reopen it with reopen=true, when you learn the answer another way (resolution = the answer), or cancel it when it no longer matters (cancelled=true). For a grilling round, pass answers=[{n, choice}] to record each answer; a partial set keeps the round open.",
     parameters: z.object({
       id: z.string().min(1).max(64),
-      resolution: z.string().min(1).max(2000),
+      resolution: z.string().min(1).max(2000).optional(),
+      answers: z.array(z.object({
+        n: z.number().int().min(1).max(12),
+        choice: z.string().min(1).max(200),
+      })).min(1).max(12).optional().describe("Grilling round: each answered question by number and letter or label"),
       cancelled: z.boolean().optional(),
       reopen: z.boolean().optional(),
     }),
-    async execute({ id, resolution, cancelled, reopen }, ctx) {
+    async execute({ id, resolution, answers, cancelled, reopen }, ctx) {
       const captain = ctxString(ctx, "threadId");
       if (!captain) return toolError("firstmate_resolve_ask runs only in a captain thread.");
       if (cancelled !== true && reopen !== true && await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${id}`) !== undefined) {
         return toolError(`Refusing: ask ${id} is a device proof card, and only the owner's tap answers a device proof card. His Works is the proof record; cancel it with cancelled=true if the build is replaced.`);
       }
-      const closed = ownerAsks.resolve(id, captain, reopen === true ? "open" : cancelled === true ? "cancelled" : "answered", resolution, Date.now());
+      if (answers !== undefined) {
+        if (cancelled === true || reopen === true) return toolError("Refusing: answers cannot be combined with cancelled or reopen.");
+        const recorded = ownerAsks.recordRoundAnswers(id, captain, answers, Date.now());
+        if (!recorded) return toolError(`No open ask ${id} for this captain.`);
+        if (recorded.error !== undefined) return toolError(`Refusing: ${recorded.error}`);
+        await refreshOwnerBoard();
+        const left = ownerAsks.listOpen(captain).length;
+        return recorded.complete
+          ? `Ask ${id} answered. ${recorded.summary}. ${left === 0 ? "No ask is open." : `${left} ask(s) still open.`}`
+          : `Ask ${id} still open. Recorded ${recorded.summary}. ${left} ask(s) still open.`;
+      }
+      if (resolution === undefined) return toolError("Pass resolution.");
+      const ask = ownerAsks.get(id);
+      if (!ask || ask.captain !== captain) return toolError(`No ask ${id} for this captain.`);
+      const action = gatedAskResolve(ask, { ownerConfirmed: false, cancelled: cancelled === true, reopen: reopen === true });
+      const closed = ownerAsks.resolve(id, captain, action === "reopen" ? "open" : action === "cancel" ? "cancelled" : "answered", resolution, Date.now());
       if (!closed) return toolError(`No ask ${id} for this captain.`);
       // Only the owning captain's cancel reaches here: a cancelled device proof card proves nothing, so its
       // binding and any pending re-read of its tap go (checker round 4).
-      if (cancelled === true) await dropDeviceProof(id);
+      if (cancelled === true || action === "cancel") await dropDeviceProof(id);
       if (reopen === true) {
         await bb.storage.kv.delete(`owner-answer-native:${id}`);
         await bb.storage.kv.delete(`owner-close-native:${id}`);
       }
       let warning = "";
-      try {
-        const result = z.object({ ok: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
-          pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "editAsk",
-          input: { askId: id, resolution, at: closed.resolvedAt ?? Date.now(), ...(reopen === true ? { reopen: true } : {}) },
-          outputSchema: z.object({ ok: z.boolean() }),
-        }));
-        if (!result.ok) warning = " The Telegram card could not be updated.";
-      } catch (error) { warning = ` The Telegram card could not be updated (${error instanceof Error ? error.message : String(error)}).`; }
+      if (!isRoundAsk(ask)) {
+        try {
+          const result = z.object({ ok: z.boolean() }).parse(await bb.sdk.plugins.callRpc({
+            pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "editAsk",
+            input: { askId: id, resolution, at: closed.resolvedAt ?? Date.now(), ...(reopen === true ? { reopen: true } : {}) },
+            outputSchema: z.object({ ok: z.boolean() }),
+          }));
+          if (!result.ok) warning = " The Telegram card could not be updated.";
+        } catch (error) { warning = ` The Telegram card could not be updated (${error instanceof Error ? error.message : String(error)}).`; }
+      }
       await refreshOwnerBoard();
+      await syncOwnerApprovalForAsk(id);
       const left = ownerAsks.listOpen(captain).length;
       return `Ask ${id} ${closed.state}. ${left === 0 ? "No ask is open." : `${left} ask(s) still open.`}${warning}`;
     },
@@ -15151,7 +15890,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   registerCaptainTool({
     name: "firstmate_reply",
-    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A text that restates the question of a card sent in the last 30 minutes is refused too. The answer carries its owner task (task, or the task this message started): in Telegram it replies to the task's status line, in the task's project topic. result=true makes it the task's result, which marks the owner's messages done; a task has one result. Each owner message gets one Telegram answer message: a later reply to it is added by an edit, one part an edit cannot hold is its continuation, and more is refused. Turn text outside this tool, firstmate_ask and firstmate_alert never reaches the owner. A text that only says the work started, or a note about the owner, is not sent and the message stays open. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own. Every owner message this reply answers is linked to its owner task or marked noWork (it asks for no work): the message's own task (the one it started, or one an earlier reply named) counts; else pass task, or noWork=true; a cover takes the reply's task or noWork, or its own as {ref, task} or {ref, noWork}. A reply with neither is refused. promise={by, what}: a dated promise in this reply, such as \"I will check on 21 Oct\"; it is a record that wakes you at that time and shows on the board until you close it with firstmate_promise.",
+    description: "Reply to one owner message as a Telegram reply to it (ref=oldest, tg:<chat>:<msg>, or bb:<thread>:<row>; any open message, in any order). quote=exact words from that message, such as one of several questions; each different quote is its own reply. more=true keeps the message open because more replies to it will follow. A text that asks the owner to decide (options A/B with a question, or a count of waiting decisions) is refused: send each decision with firstmate_ask. A grilling question batch is one firstmate_ask round, not this tool. A text that restates the question of a card sent in the last 30 minutes is refused too. The answer carries its owner task (task, or the task this message started): in Telegram it replies to the task's status line, in the task's project topic. result=true makes it the task's result, which marks the owner's messages done; a task has one result. Each owner message gets one Telegram answer message: a later reply to it is added by an edit, one part an edit cannot hold is its continuation, and more is refused. Turn text outside this tool, firstmate_ask and firstmate_alert never reaches the owner. A text that only says the work started, or a note about the owner, is not sent and the message stays open. covers=refs of other open messages this reply also answers, such as forwarded messages or a burst on one request: they close with no Telegram message of their own. Every owner message this reply answers is linked to its owner task or marked noWork (it asks for no work): the message's own task (the one it started, or one an earlier reply named) counts; else pass task, or noWork=true; a cover takes the reply's task or noWork, or its own as {ref, task} or {ref, noWork}. A reply with neither is refused. promise={by, what}: a dated promise in this reply, such as \"I will check on 21 Oct\"; it is a record that wakes you at that time and shows on the board until you close it with firstmate_promise.",
     parameters: z.object({
       ref: z.string().min(1).optional().describe("The owner message: oldest, tg:<chat>:<msg> or bb:<thread>:<row>. Unset with task: the first owner message of that task"),
       text: z.string().min(1).max(4000),
@@ -15507,6 +16246,7 @@ export default async function plugin(bb: BbPluginApi) {
           const sourceRefs = keys.map((key) => `${key!.source === "telegram" ? "tg" : "bb"}:${key!.chatId}:${key!.messageId}`);
           // A task opened by hand has no project until its first crew: never the captain thread's project.
           const opened = ownerTasks.open({ captain, project: null, projectId: null, title, sourceRefs, at: now });
+          await refreshApprovalForTask(opened);
           await refreshOwnerBoard();
           return `Task ${opened.id} is open (${opened.state}).`;
         }
@@ -15531,6 +16271,7 @@ export default async function plugin(bb: BbPluginApi) {
           ownerTasks.linkPr(id, captain, ref, now);
           reconcileTasks(captain, now);
           changed = ownerTasks.get(id)!;
+          await refreshApprovalForTask(changed);
         } else {
           const to: TaskState | undefined = state;
           if (to === undefined) return toolError(`${action} needs state.`);
@@ -15540,6 +16281,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (action === "set" && current?.captain === captain && isFinishedTask(current)) return toolError(`Task ${id} is ${current.state}; it reopens only when new work arrives on it (a new crew or PR). For new work the owner asks for, dispatch with taskRef=${id}.`);
           changed = ownerTasks.move(id, captain, to === "dropped" ? { to, reason: reason ?? "", ref: ref ?? "" } : to === "live" ? { to, reason: reason ?? "" } : { to, reason }, now);
         }
+        if (action === "close") await refreshApprovalForTask(changed);
         await refreshOwnerBoard();
         return `Task ${changed.id} is ${changed.state}${changed.dropReason ? ` (${changed.dropReason})` : ""}.`;
       } catch (error) {
@@ -15636,6 +16378,7 @@ export default async function plugin(bb: BbPluginApi) {
     const task = held !== undefined
       ? ownerTasks.attach(held.id, captain, { crewId: crew.id, sourceRefs: refs, at: Date.now() })
       : ownerTasks.open({ captain, project: await projectLabel(crew.projectId), projectId: crew.projectId, title: crew.title ?? crew.task.split("\n")[0]!.slice(0, 120), sourceRefs: refs, crewId: crew.id, at: Date.now() });
+    await refreshApprovalForTask(task);
     await refreshOwnerBoard();
     return ` Owner message ${refs.join(", ")} is on owner task ${task.id}.`;
   }
@@ -15769,6 +16512,22 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         return toolError(error instanceof Error ? error.message : "Merge failed.");
       }
+    },
+  });
+
+  registerCaptainTool({
+    name: "firstmate_prod_check",
+    description: "Crews must run this before a production merge or deploy. It refuses without an owner approval or pre-approval for that work.",
+    parameters: z.object({
+      project: z.string().min(1).describe("Project name as on the board"),
+      what: z.enum(["merge", "deploy"]),
+      task: z.string().regex(/^T\d+$/).optional().describe("Owner task T<n> this merge or deploy is for"),
+      pr: z.string().optional().describe("PR as owner/repo#N or a GitHub PR URL"),
+    }),
+    async execute({ project, what, task, pr }, ctx) {
+      const result = await runProdCheck({ project, what, task, pr, threadId: ctxString(ctx, "threadId") });
+      if (!result.ok) return toolError(result.reason);
+      return result.reason;
     },
   });
 
@@ -16495,23 +17254,49 @@ export default async function plugin(bb: BbPluginApi) {
       if (ok) await refreshOwnerBoard();
       return { ok };
     },
-    async resolveAsk({ threadId, id, resolution }) {
+    async resolveAsk({ threadId, id, resolution, answeredAt, tapId }) {
       if (!(await isCaptainThread(threadId))) return { ok: false };
-      const current = ownerAsks.get(id);
-      if (!current || current.captain !== threadId) return { ok: false };
-      const sameAnswer = current.state === "answered" && (current.resolution ?? "").trim().toLowerCase() === resolution.trim().toLowerCase();
-      if (current.state !== "open" && !sameAnswer) return { ok: false };
-      let ownerConfirmed = !productionApprovals.has(id);
-      if (!ownerConfirmed) {
+      const ask = ownerAsks.get(id);
+      if (!ask || ask.captain !== threadId) return { ok: false };
+      const sameAnswer = ask.state === "answered" && (ask.resolution ?? "").trim().toLowerCase() === resolution.trim().toLowerCase();
+      const deviceProof = await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${id}`) !== undefined;
+      const prodCard = productionApprovals.has(id);
+      let ownerConfirmed = false;
+      let fromConnector: { tapId?: string; answeredAt?: number } | undefined;
+      if (deviceProof) {
+        // Device-proof RPC must answer even when ownerAnswer is still null: ownerAnsweredAsk re-reads the tap.
+        ownerConfirmed = true;
+      } else {
         try {
-          const tapped = z.object({ answer: z.string().nullable() }).parse(await bb.sdk.plugins.callRpc({
-            pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ownerAnswer", input: { askId: id }, outputSchema: z.object({ answer: z.string().nullable() }),
+          const tapped = connectorOwnerAnswerSchema.parse(await bb.sdk.plugins.callRpc({
+            pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ownerAnswer", input: { askId: id }, outputSchema: connectorOwnerAnswerSchema,
           }));
           ownerConfirmed = tapped.answer !== null && tapped.answer.trim().toLowerCase() === resolution.trim().toLowerCase();
-        } catch { /* An RPC correction can close a card, but cannot grant production approval. */ }
+          fromConnector = tapped;
+        } catch {
+          // Connector down or a stub with no answer field: an ordinary open/answered card may still
+          // record as owner. A production-approval card stays unconfirmed (fail closed). A replaced
+          // or defaulted card stays closed.
+          ownerConfirmed = !prodCard && ask.state !== "cancelled" && ask.state !== "defaulted";
+        }
       }
-      const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now(), ownerConfirmed ? "owner" : undefined) !== undefined;
+      if ((ask.state === "cancelled" || ask.state === "defaulted") && !ownerConfirmed) return { ok: false };
+      if (ask.state !== "open" && !sameAnswer && !ownerConfirmed) return { ok: false };
+      const action = gatedAskResolve(ask, { ownerConfirmed });
+      if (action === "cancel") {
+        const ok = ownerAsks.resolve(id, threadId, "cancelled", resolution, Date.now()) !== undefined;
+        if (ok) await refreshOwnerBoard();
+        if (ok) await syncOwnerApprovalForAsk(id);
+        return { ok };
+      }
+      const tap = connectorTap({
+        tapId: tapId || fromConnector?.tapId,
+        answeredAt: answeredAt ?? fromConnector?.answeredAt,
+      });
+      const ok = ownerAsks.resolve(id, threadId, "answered", resolution, Date.now(), ownerConfirmed ? "owner" : undefined, ownerConfirmed ? tap : undefined) !== undefined;
       if (ok) await drainAskFollowUps();
+      if (ok && !ownerConfirmed) await refreshOwnerBoard();
+      if (ok) await syncOwnerApprovalForAsk(id);
       return { ok };
     },
     async closeAsk({ threadId, ids }) {
@@ -16556,12 +17341,18 @@ export default async function plugin(bb: BbPluginApi) {
         // Owner decision Q5: merged work that production does not run yet, with its next step and who takes it.
         const status = await liveStatusOf(threadId);
         const notLive = notLiveItems(tasks, (task) => planOf(ruleOf(task, deliveries.forTasks(task.crewIds, task.prs)), status), now);
-        const undelivered: { crewId: string }[] = [];
+        const undelivered: { crewId?: string; recovery?: string }[] = [];
         for (const job of [...ownerAsks.failedFollowUps(), ...ownerAsks.pendingFollowUps()]) {
           if (job.effect !== "owner-answered") continue;
           const ask = ownerAsks.get(job.askId);
-          const crewId = crewIdFromWaitRef(ask?.sourceRef);
-          if (!ask || ask.captain !== threadId || !crewId) continue;
+          if (!ask || ask.captain !== threadId) continue;
+          const crewId = crewIdFromWaitRef(ask.sourceRef);
+          if (!crewId) {
+            if (job.state === "failed" && await bb.storage.kv.get(`${DEVICE_PROOF_PREFIX}${job.askId}`) !== undefined) {
+              undelivered.push({ recovery: "retry by asking again" });
+            }
+            continue;
+          }
           if (job.state === "failed") { undelivered.push({ crewId }); continue; }
           const rec = await bb.storage.kv.get<{ state?: string }>(`owner-answer-sent:${job.askId}:${job.answerSeq}`);
           if (rec?.state === "unknown" || rec?.state === "sending") undelivered.push({ crewId });
@@ -17150,9 +17941,40 @@ export default async function plugin(bb: BbPluginApi) {
   const knownCaptains = knownCaptainsRef;
   for (const key of await bb.storage.kv.list(CAPTAIN_PROJECT_PREFIX)) knownCaptains.add(key.slice(CAPTAIN_PROJECT_PREFIX.length));
   const heldPingCaptains = new Set<string>();
+  async function readConnectorOwnerAnswer(askId: string): Promise<{ answer: string | null; tap?: { tapId: string; answeredAt: number } }> {
+    try {
+      const read = connectorOwnerAnswerSchema.parse(await bb.sdk.plugins.callRpc({
+        pluginId: TELEGRAM_BRIDGE_PLUGIN_ID, method: "ownerAnswer", input: { askId },
+        outputSchema: connectorOwnerAnswerSchema,
+      }));
+      return { answer: read.answer, tap: connectorTap(read) };
+    } catch {
+      return { answer: null };
+    }
+  }
+
+  function matchesOwnerAnswer(ask: OwnerAsk, expected: string, confirmed: string | null): boolean {
+    if (confirmed === null) return false;
+    if (confirmed.trim().toLowerCase() === expected.trim().toLowerCase()) return true;
+    return askLetterAnswer(ask, confirmed) === expected;
+  }
+
+  async function recordOneAskAnswer(captainThreadId: string, ask: OwnerAsk, answer: string): Promise<boolean> {
+    let tap: { tapId: string; answeredAt: number } | undefined;
+    if (ask.kind === "approval" || ask.irreversible) {
+      const read = await readConnectorOwnerAnswer(ask.id);
+      if (!matchesOwnerAnswer(ask, answer, read.answer)) return false;
+      tap = read.tap;
+    }
+    if (!ownerAsks.resolve(ask.id, captainThreadId, "answered", answer, Date.now(), "owner", tap)) return false;
+    await syncOwnerApprovalForAsk(ask.id);
+    return true;
+  }
+
   // An owner reply to an ask card, or a tap on one of its buttons, answers that ask.
   // Only the connector header at the start of the message counts, so quoted text cannot answer one.
-  function recordAskAnswers(captainThreadId: string, text: string, queued: readonly unknown[]): Array<{ id: string; answer: string }> {
+  // An approval or irreversible card counts only after connector evidence confirms the owner.
+  async function recordAskAnswers(captainThreadId: string, text: string, queued: readonly unknown[]): Promise<Array<{ id: string; answer: string }>> {
     const texts = queued.length > 0
       ? queued.map((row) => String(asRecord(row)["text"] ?? asRecord(asRecord(row)["input"])["text"] ?? text))
       : [text];
@@ -17161,7 +17983,9 @@ export default async function plugin(bb: BbPluginApi) {
       const header = parseConnectorHeader(message);
       if (header && !header.forwarded && header.sourceEventId?.startsWith("pack:")) {
         for (const { id, answer } of packAnswers(header.body)) {
-          if (ownerAsks.get(id)?.state === "open" && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) answered.push({ id, answer });
+          const ask = ownerAsks.get(id);
+          if (!ask || ask.state !== "open") continue;
+          if (await recordOneAskAnswer(captainThreadId, ask, answer)) answered.push({ id, answer });
         }
         continue;
       }
@@ -17169,7 +17993,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (!header || header.forwarded || id === null) continue;
       const ask = ownerAsks.get(id);
       const answer = ask ? askLetterAnswer(ask, header.body) : null;
-      if (ask?.state === "open" && answer !== null && ownerAsks.resolve(id, captainThreadId, "answered", answer, Date.now(), "owner")) answered.push({ id, answer });
+      if (!ask || ask.state !== "open" || answer === null) continue;
+      if (await recordOneAskAnswer(captainThreadId, ask, answer)) answered.push({ id, answer });
     }
     return answered;
   }
@@ -17212,8 +18037,24 @@ export default async function plugin(bb: BbPluginApi) {
           await bb.storage.kv.set(`workstream-ref:tg:${telegram.chatId}:${telegram.messageId}`,w.id);
         }
         if (String(context.initiator) === "user") {
-          recordAskAnswers(threadId, text, context.queuedMessages ?? []);
+          await recordAskAnswers(threadId, text, context.queuedMessages ?? []).catch((error) => bb.log.warn(`owner ask answer: ${String(error)}`));
           followUp.push(() => drainAskFollowUps());
+        }
+        const queued = context.queuedMessages ?? [];
+        const rows: unknown[] = queued.length > 0 ? queued : [undefined];
+        for (const row of rows) {
+          const rec = asRecord(row);
+          const initiator = row === undefined ? context.initiator : rec["initiator"];
+          if (String(initiator) !== "user") continue;
+          const rowText = row === undefined ? text : String(rec["text"] ?? asRecord(rec["input"])["text"] ?? text);
+          await considerOwnerPreApproval(threadId, rowText, {
+            initiator,
+            senderThreadId: row === undefined ? context.senderThreadId : rec["senderThreadId"],
+            origin: row === undefined ? asRecord(context)["origin"] : rec["origin"],
+            originPluginId: row === undefined ? asRecord(context)["originPluginId"] : rec["originPluginId"],
+            submissionPluginId: asRecord(context.experimental_submission).pluginId,
+            submissionData: context.experimental_submission?.data,
+          }).catch((error) => bb.log.warn(`owner pre-approval: ${String(error)}`));
         }
         let turnRefs: string[] = [];
         const inbound = inboundHookDecision({
@@ -17364,7 +18205,7 @@ export default async function plugin(bb: BbPluginApi) {
   } catch (error) {
     bb.log.warn(`message.dispatch hook unavailable; crew pings join running turns: ${String(error)}`);
   }
-  void drainAskFollowUps().catch((error) => bb.log.warn(`ask follow-up startup: ${String(error)}`));
+  void backgroundBudget.run("follow-up", () => drainAskFollowUps()).catch((error) => bb.log.warn(`ask follow-up startup: ${String(error)}`));
 
   const CAPTAIN_COMPACT_COOLDOWN_MS = 20 * 60_000;
   const compactionChecks = new Set<string>();
@@ -17845,9 +18686,10 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "program", summary: "Programs (epics): one record per multi-ticket job, open until every ticket is done or dropped", usage: "bb firstmate program list | show <P-id> | refresh | create <epic-url> [--title t] [--task T<n>] [--ref tg:<chat>:<msg> ...] | set <P-id> <ticket> [<ticket> ...] --state blocked|dropped|ready|running|in-review|done [--reason r] [--ask id] [--crew id] [--pr ref]" },
       { name: "prs", summary: "Read-only: open PRs by this GitHub account in the captain's projects with their tracking status, untracked first. sweep: adopt now every open PR no open task links (it also runs hourly)", usage: "bb firstmate prs [--json] | prs sweep" },
       { name: "promises", summary: "Dated promises to the owner: list, close one, or import the captain's follow-ups file once (dry run unless --apply)", usage: "bb firstmate promises list | kept <P-id> [--reason r] | dropped <P-id> --reason r | import [--captain <thread>] [--file <path>] [--apply] [--skip <line> ...]" },
-      { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json]" },
+      { name: "launches", summary: "Inspect reservations or explicitly adopt an existing legacy worker", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json] | release <task-id>" },
       { name: "deliver", summary: "Outcome + committed/uncommitted diff + PR", usage: "bb firstmate deliver <crew-id>" },
       { name: "merge", summary: "Merge PR or local-only ff-only land", usage: "bb firstmate merge <crew-id> [--pr <number|url>] [--yes] [--keep-crew] [--allow-unverified <owner words>]" },
+      { name: "prod-check", summary: "Refuse a production merge or deploy without owner approval or pre-approval", usage: "bb firstmate prod-check <project> <merge|deploy> [--task T<n>] [--pr owner/repo#N]" },
       { name:"scout-report",summary:"Read the complete owned promotion artifact",usage:"bb firstmate scout-report <id> [--json]" },
       { name: "promote", summary: "Scout → new ship carrying the report", usage: "bb firstmate promote <crew-id>" },
       { name: "queue", summary: "Backlog with deps/time gates; reconcile restores exact native linkage without launching; prune forgets finished items", usage: queueHelp },
@@ -17865,7 +18707,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "forget", summary: "Drop a crew record", usage: "bb firstmate forget <crew-id> [--stop] [--force \"<the owner's words>\"]" },
       { name: "wip-backup", summary: "Back up unpushed crew commits to wip/ branches now", usage: "bb firstmate wip-backup" },
       { name: "create-worker", summary: "Internal atomic native worker creation", usage: "bb firstmate create-worker --task <id> --project <id> --home <path> --host <id> --path <path> --prompt-file <path>" },
-      { name: "launches", summary: "Inspect durable launch reservations", usage: "bb firstmate launches [--json]" },
+      { name: "launches", summary: "Inspect durable launch reservations", usage: "bb firstmate launches list | adopt <task-id> --thread <thread-id> [--check] [--json] | release <task-id>" },
       { name: "mark-crew", summary: "Tag a thread as a firstmate crew (used by the real-mode bb backend)", usage: "bb firstmate mark-crew <thread-id> [--shape ship|scout]" },
       { name: "migrate-state", summary: "Import the KV crew cache into authoritative real state (idempotent)", usage: "bb firstmate migrate-state [--json]" },
       { name: "migrate-owners", summary: "Project KV queue/decisions/afk/quiet/memory into the real files for owners set to real (idempotent)", usage: "bb firstmate migrate-owners [--json]" },
@@ -18320,6 +19162,12 @@ export default async function plugin(bb: BbPluginApi) {
               const result=await adoptLegacyLaunch(rest[1]!,threadId,ctxThread,ctxProject,flags.has("check"),signal);
               return reply(result,`${result.adopted ? "Adopted" : "Eligible"} task ${result.taskId}, thread ${result.threadId}, worktree ${result.worktree}; worker ${result.workerStatus}. Original admission unconfirmed. Merge remains a separate native guarded operation.`);
             }
+            if (rest[0] === "release") {
+              if (!ctxThread || !ctxProject || rest.length!==2) return fail("Usage in owning captain/project: bb firstmate launches release <task-id>");
+              if ([...flags.keys()].some(key=>key!=="json")) return fail("Release cannot change launch options or authority.");
+              const result=await releaseStuckLaunch(rest[1]!,ctxThread,ctxProject,signal);
+              return reply(result,`Released ${result.taskId}`);
+            }
             if (rest.length>0 && (rest[0]!=="list" || rest.length>1)) return fail(usage);
             const rows = launches.list(ctxThread,Math.max(1,Number(flagStr(flags,"limit")) || 50),Math.max(0,Number(flagStr(flags,"offset")) || 0));
             return reply(rows, rows.map(r => `${r.taskId} ${r.state} ${r.threadId ?? "unknown worker"} ${r.error ?? ""}`).join("\n"));
@@ -18402,6 +19250,14 @@ export default async function plugin(bb: BbPluginApi) {
               allowUnverified: flagStr(flags, "allow-unverified"),
             });
             return reply({ merged: flags.has("yes"), preview: !flags.has("yes"), id, pr: flagStr(flags, "pr") ?? null, crewKept: flags.has("keep-crew") }, text);
+          }
+          case "prod-check": {
+            const project = rest[0];
+            const what = rest[1];
+            if (!project || (what !== "merge" && what !== "deploy")) return fail("Usage: bb firstmate prod-check <project> <merge|deploy> [--task T<n>] [--pr owner/repo#N]");
+            const result = await runProdCheck({ project, what, task: flagStr(flags, "task"), pr: flagStr(flags, "pr"), threadId: ctxThread });
+            if (!result.ok) return fail(result.reason);
+            return reply({ ok: true, reason: result.reason }, result.reason);
           }
           case "handoff": {
             const from = flagStr(flags, "from");
@@ -18939,7 +19795,7 @@ export default async function plugin(bb: BbPluginApi) {
     taskSweepWork = (async () => {
       for (const captain of knownCaptains) await sweepTasks(captain).catch((error) => bb.log.warn(`task sweep captain=${captain}: ${String(error)}`));
       await expireLeases().catch((error) => bb.log.warn(`lease expiry: ${String(error)}`));
-      await drainAskFollowUps().catch((error) => bb.log.warn(`ask follow-up retry: ${String(error)}`));
+      await backgroundBudget.run("follow-up", () => drainAskFollowUps()).catch((error) => bb.log.warn(`ask follow-up retry: ${String(error)}`));
     })();
     try { await taskSweepWork; } finally { taskSweepWork = undefined; }
   });

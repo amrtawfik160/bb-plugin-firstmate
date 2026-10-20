@@ -1,4 +1,4 @@
-import type { ReplacementContract } from './replacement.ts';
+import { replacementSupersedable, SUPERSEDED_REPLACEMENT, type ReplacementContract } from './replacement.ts';
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
 
 export type LaunchState = 'reserved' | 'creating' | 'provisioning' | 'running' | 'failed' | 'uncertain' | 'deleted';
@@ -6,7 +6,7 @@ export interface LaunchRecord {
   key: string; taskId: string; projectId: string; owner: string; home: string;
   generation: number; shape: string; state: LaunchState; threadId: string | null;
   replacement?:ReplacementContract;
-  yolo?:boolean; nativeInvoked?: boolean; deliveryMode?: string; deliveryRequirement?: 'pr' | 'merged' | 'merged-and-verified';
+  yolo?:boolean; nativeInvoked?: boolean; creationRequested?: boolean; attemptToken?: string; createWorkerStarted?: boolean; deliveryMode?: string; deliveryRequirement?: 'pr' | 'merged' | 'merged-and-verified';
   hostId?: string; path?: string; error?: string; updatedAt: number;
   execution?: { providerId: string | null; model: string | null; reasoningLevel: string | null };
   adoption?: { threadId:string; environmentId:string; worktree:string; proof:string; briefSha:string; promptSha:string; createdAt:number; originalUpdatedAt:number; originalError?:string; execution?:{model:string;reasoningLevel:string;permissionMode:string}; phase:'publishing'|'complete' };
@@ -14,6 +14,32 @@ export interface LaunchRecord {
 type Database = ReturnType<BbPluginApi['storage']['database']>;
 export const launchTaskKey=(project:string,task:string)=>JSON.stringify([project,task]);
 export const launchKey = (project: string, owner: string, home: string, task: string, generation = 1) => JSON.stringify([project, owner, home, task, generation]);
+
+/** Host python for native launch admission. No single quotes: server.ts wraps it with shQuote. */
+export const ATTEMPT_TOKEN_ENVIRON_PY = [
+  "import sys",
+  "pid=sys.argv[1]",
+  "val=\"\"",
+  "try:",
+  " data=open(\"/proc/%s/environ\"%pid,\"rb\").read().split(b\"\\0\")",
+  " for item in data:",
+  "  if item.startswith(b\"FM_BB_ATTEMPT_TOKEN=\"):",
+  "   val=item.split(b\"=\",1)[1].decode(\"utf-8\",\"replace\")",
+  "   break",
+  "except OSError:",
+  " pass",
+  "print(\"FM_BB_ATTEMPT_TOKEN=%s\"%val)",
+].join("\n");
+
+/** Token printed by admission after proving the native fm-spawn pid and lock. */
+export function attemptTokenFromAdmissionOutput(output: string): string | undefined {
+  let found: string | undefined;
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("FM_BB_ATTEMPT_TOKEN=")) found = line.slice("FM_BB_ATTEMPT_TOKEN=".length);
+  }
+  if (found === undefined || found === "") return undefined;
+  return found;
+}
 
 /** A durable reservation outlives the RPC which starts creation. Absence from a
  * bounded inventory is never proof that a timed-out create did not succeed. */
@@ -99,7 +125,8 @@ export function createLaunches(db: Database) {
       return update(expected.key,{state:'provisioning',threadId:adoption.threadId,adoption,error:'Explicit adoption publication incomplete; repeat with this exact thread.'});
     })();
   }
-  async function reserve(record: LaunchRecord, capacity: () => Promise<{ cap: number; activeTaskIds: string[] }>, overCap = false) {
+  /** supersedeKey: an earlier replacement of the same source that never asked BB for a worker; failed in the same transaction. */
+  async function reserve(record: LaunchRecord, capacity: () => Promise<{ cap: number; activeTaskIds: string[] }>, overCap = false, supersedeKey?: string) {
     const run = tail.then(async () => {
       const prior = get(record.key);
       if (prior && prior.state !== 'failed') return prior;
@@ -110,7 +137,12 @@ export function createLaunches(db: Database) {
         const active = new Set(activeTaskIds);
         for (const held of heldTaskIds(record.owner)) active.add(held);
         if (!overCap && cap > 0 && !active.has(launchTaskKey(record.projectId,record.taskId)) && active.size >= cap) throw new Error(`Crew cap reached: ${active.size} crews running or reserved (cap ${cap}). Queue this task until capacity is available.`);
-        return save(record);
+        if (supersedeKey !== undefined) {
+          const stale = get(supersedeKey);
+          if (!stale || !replacementSupersedable(stale)) throw new Error('An existing replacement has a different immutable request. Reconcile that exact request first.');
+          if (stale.state !== 'failed') update(supersedeKey, { state: 'failed', error: SUPERSEDED_REPLACEMENT });
+        }
+        return save({ ...record, creationRequested: record.creationRequested === true });
       })();
     });
     tail = run.catch(() => {});
@@ -123,7 +155,20 @@ export function createLaunches(db: Database) {
     inFlight.set(key, work);
     return work;
   }
-  async function create(key: string, spawn: () => Promise<{ id: string }>, signal?: AbortSignal, timeoutMs=30_000) {
+  function compareAndReleaseFailed(expected: LaunchRecord, boundHome: string, reason: string, pluginStartedAt?: number): LaunchRecord {
+    return db.transaction(() => {
+      const current = get(expected.key);
+      const createStillActive = current?.createWorkerStarted === true && !(pluginStartedAt !== undefined && current.updatedAt < pluginStartedAt);
+      if (!current || current.key !== expected.key || current.updatedAt !== expected.updatedAt ||
+          current.state !== 'uncertain' || current.threadId || current.creationRequested === true ||
+          current.adoption || current.home !== boundHome || current.home !== expected.home ||
+          createStillActive) {
+        throw new Error('Release refused: the launch changed before the slot could be freed.');
+      }
+      return update(expected.key, { state: 'failed', error: reason });
+    })();
+  }
+  async function create(key: string, spawn: () => Promise<{ id: string }>, signal?: AbortSignal, timeoutMs=30_000, expectedAttemptToken?: string) {
     return once(key, async () => {
       const record = get(key);
       if (!record) throw new Error('Launch reservation missing');
@@ -135,7 +180,10 @@ export function createLaunches(db: Database) {
       db.transaction(() => {
         const current=get(key)!;
         if (current.state !== 'reserved') throw new Error(`Launch ${current.taskId} requires reconciliation before creation.`);
-        update(key, { state: 'creating' });
+        if (expectedAttemptToken !== undefined && (current.attemptToken ?? "") !== expectedAttemptToken) {
+          throw new Error('Creation refused: attempt token mismatch.');
+        }
+        update(key, { state: 'creating', creationRequested: true });
       })();
       try {
         const pending = spawn().then(thread => {
@@ -172,7 +220,7 @@ export function createLaunches(db: Database) {
       }
     });
   }
-  return { get, save, update, list, withWorkers, heldTaskIds,hasRuntimeConsumers, forTask,reassignWorker,workerDeleted,isDeletedWorker,adoptionTask,claimAdoption,reserve, once, create };
+  return { get, save, update, list, withWorkers, heldTaskIds,hasRuntimeConsumers, forTask,reassignWorker,workerDeleted,isDeletedWorker,adoptionTask,claimAdoption,reserve, once, compareAndReleaseFailed, create };
 }
 
 async function recoveryRead<T>(operation:Promise<T>,signal?:AbortSignal):Promise<T> {
@@ -198,6 +246,38 @@ export async function discoverLaunch(bb: BbPluginApi, record: LaunchRecord, sign
     }
     if (matches.length > 1) throw new Error(`Multiple workers match launch ${record.taskId}; manual reconciliation required.`);
     if (rows.length < 50) break;
+  }
+  return matches[0] ?? null;
+}
+
+export const LAUNCH_INVENTORY_PAGE_SIZE = 50;
+export const LAUNCH_INVENTORY_MAX_OFFSET = 1000;
+
+/** Exhaustive inventory for legacy release. Does not change discoverLaunch. */
+export async function discoverLaunchComplete(bb: BbPluginApi, record: LaunchRecord, signal?: AbortSignal): Promise<string | null> {
+  const matches: string[] = [];
+  for (let offset = 0; ; offset += LAUNCH_INVENTORY_PAGE_SIZE) {
+    if (offset >= LAUNCH_INVENTORY_MAX_OFFSET) throw new Error('Release refused: inventory page limit was hit.');
+    signal?.throwIfAborted();
+    let rows: Awaited<ReturnType<BbPluginApi['sdk']['threads']['list']>>;
+    try {
+      rows = await recoveryRead(bb.sdk.threads.list({ projectId: record.projectId, parentThreadId: record.owner || undefined,
+        includeHidden: true, limit: LAUNCH_INVENTORY_PAGE_SIZE, offset, signal }), signal);
+    } catch (error) {
+      throw new Error(`Release refused: an inventory page read failed. ${String(error)}`);
+    }
+    if (!Array.isArray(rows)) throw new Error('Release refused: an inventory page read failed.');
+    for (const row of rows) {
+      let meta: Awaited<ReturnType<BbPluginApi['sdk']['threads']['getPluginMetadata']>>;
+      try {
+        meta = await recoveryRead(bb.sdk.threads.getPluginMetadata({ threadId: row.id, signal }), signal);
+      } catch (error) {
+        throw new Error(`Release refused: an inventory page read failed. ${String(error)}`);
+      }
+      if (meta.launchKey === record.key && meta.generation === record.generation && (meta.nativeHome === record.home || meta.nativeParentHome === record.home)) matches.push(row.id);
+    }
+    if (matches.length > 1) throw new Error(`Multiple workers match launch ${record.taskId}; manual reconciliation required.`);
+    if (rows.length < LAUNCH_INVENTORY_PAGE_SIZE) break;
   }
   return matches[0] ?? null;
 }

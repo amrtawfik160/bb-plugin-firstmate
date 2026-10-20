@@ -1,4 +1,4 @@
-import { createOwnerAsks } from "./owner-asks.ts";
+import { createOwnerAsks, isRoundAsk } from "./owner-asks.ts";
 import { createOwnerTasks, isOpenTask } from "./owner-tasks.ts";
 
 /** Resolution written on a question that was a status record, not an owner choice. */
@@ -33,7 +33,7 @@ export function repairStatusQuestionCards(db: Database, now = Date.now()): Statu
   const captains = [...new Set((db.prepare("SELECT DISTINCT captain FROM owner_ask").all() as { captain: string }[]).map((row) => row.captain))];
   for (const captain of captains) {
     for (const ask of asks.listOpen(captain)) {
-      if (ask.kind !== "question" || ask.options.length > 0) continue;
+      if (ask.kind !== "question" || ask.options.length > 0 || isRoundAsk(ask)) continue;
       let noted = false;
       if (ask.task) {
         const task = tasks.get(ask.task);

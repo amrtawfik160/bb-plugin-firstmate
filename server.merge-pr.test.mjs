@@ -71,7 +71,10 @@ function approve(host, prs, {source='owner',resolution='Approve',state='answered
  const bindings=createProductionApprovals(host.bb.storage.database());
  const ask=asks.create({captain,kind,text:`Merge ${prs.map(n=>`cyndra-ai/cyndra-saas#${n}`).join(', ')}?`,options:[{label:'Approve',value:'approve'},{label:'No',value:'no'}],createdAt:Date.now()});
  bindings.bindCard(ask.id,prs.map(n=>({pr:`cyndra-ai/cyndra-saas#${n}`,head:head(n)})));
- if(state!=='open') asks.resolve(ask.id,captain,state,resolution,Date.now(),source==='owner'?'owner':undefined);
+ if(state!=='open') {
+  const at=Date.now();
+  asks.resolve(ask.id,captain,state,resolution,at,source==='owner'?'owner':undefined,source==='owner'?{tapId:'test:'+ask.id,answeredAt:at}:undefined);
+ }
  return ask;
 }
 const tool=(host,name)=>host.harness.inspection.registrations.agentTools.find(t=>t.name===name);
@@ -366,10 +369,12 @@ test('approval card creation binds the named PR and only the owner RPC grants pe
   const asks=createOwnerAsks(host.bb.storage.database());
   const ask=asks.listOpen('thr_cap')[0];assert.ok(ask,asked);
   await tool(host,'firstmate_resolve_ask').execute({id:ask.id,resolution:'Approve'},ctx);
+  assert.equal(asks.get(ask.id)?.state,'cancelled');
   let out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391},ctx));
   assert.match(out,/owner approval card/);assert.deepEqual(merges(commands),[]);
-  host.harness.sdk.stub('plugins.callRpc',async()=>({answer:'Approve',ok:true}));
-  const answered=await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:ask.id,resolution:'Approve'});
+  const stamp={answeredAt:Date.now(),tapId:'board:'+ask.id};
+  host.harness.sdk.stub('plugins.callRpc',async()=>({answer:'Approve',ok:true,...stamp}));
+  const answered=await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:ask.id,resolution:'Approve',...stamp});
   assert.equal(answered.ok,true);
   out=text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391},ctx));
   assert.match(out,/^Merged/);assert.equal(merges(commands).length,1);
@@ -477,7 +482,14 @@ async function connectorApprovalProbe(channel,action,label,legacy) {
  await import(pathToFileURL(joinPath(approvalTelegram,'test/register.mjs')).href);
  const {baseConfig,cycle,makeHarness,openStore}=await import(pathToFileURL(joinPath(approvalTelegram,'test/support.ts')).href);
  const {host,commands}=await deck([2391],{approved:false});const {store,db}=openStore();
- const tg=makeHarness({store,config:baseConfig({captainThreadId:'thr_cap',threadedReplies:'on',pinnedBoard:false}),resolveAsk:input=>host.harness.behavior.callRpc('resolveAsk',input)});
+ const tg=makeHarness({store,config:baseConfig({captainThreadId:'thr_cap',threadedReplies:'on',pinnedBoard:false}),resolveAsk:async input=>{
+  assert.match(input.tapId,channel==='board'?/^board:/:/^telegram-callback:/);
+  assert.equal(typeof input.answeredAt,'number');
+  const result=await host.harness.behavior.callRpc('resolveAsk',input);
+  const stored=host.bb.storage.database().prepare('SELECT tap_id,at FROM owner_ask_answer WHERE id=?').get(input.id);
+  if(result.ok){assert.equal(stored.tap_id,input.tapId);assert.equal(stored.at,input.answeredAt);}
+  return result;
+ }});
  try {
   host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
   host.harness.sdk.stub('plugins.callRpc',async({method,input})=>method==='ask'?tg.engine.enqueueAskRouted(input):method==='ownerAnswer'?tg.engine.ownerAnswer(input):method==='editAsk'?tg.engine.editAsk(input):{ok:true});
@@ -526,8 +538,9 @@ test('structured PR targets alone bind approval and appear as the exact approval
   host.harness.sdk.stub('threads.getPluginMetadata',async()=>({captain:'true'}));
   const out=text(await tool(host,'firstmate_ask').execute({kind:'approval',prs:['cyndra-ai/cyndra-saas#2391'],question:'Publish the fix? To undo, revert cyndra-ai/cyndra-saas#2371.',project:'Cyndra'},ctx));
   const ask=createOwnerAsks(host.bb.storage.database()).listOpen('thr_cap')[0];assert.ok(ask,out);
-  host.harness.sdk.stub('plugins.callRpc',async()=>({answer:'Approve',ok:true}));
-  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:ask.id,resolution:'Approve'});
+  const stamp={answeredAt:Date.now(),tapId:'board:'+ask.id};
+  host.harness.sdk.stub('plugins.callRpc',async()=>({answer:'Approve',ok:true,...stamp}));
+  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:ask.id,resolution:'Approve',...stamp});
   assert.match(text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2371},ctx)),/Refusing:.*owner approval card/);
   assert.equal(ask.text.split('\n\nPRs approved by this card:\n')[1],'- cyndra-ai/cyndra-saas#2391');
   assert.match(text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr:2391},ctx)),/^Merged/);
@@ -556,8 +569,9 @@ test('one structured approval renders and grants exactly its canonical deduplica
   await tool(host,'firstmate_ask').execute({kind:'approval',prs:['CYNDRA-AI/cyndra-saas#2391','cyndra-ai/cyndra-saas#2371','cyndra-ai/cyndra-saas#2391'],question:'Release both fixes? Undo: revert their merges.',project:'Cyndra'},ctx);
   const ask=createOwnerAsks(host.bb.storage.database()).listOpen('thr_cap')[0];assert.ok(ask);
   assert.equal(ask.text.split('\n\nPRs approved by this card:\n')[1],'- cyndra-ai/cyndra-saas#2391\n- cyndra-ai/cyndra-saas#2371');
-  host.harness.sdk.stub('plugins.callRpc',async()=>({answer:'Approve',ok:true}));
-  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:ask.id,resolution:'Approve'});
+  const stamp={answeredAt:Date.now(),tapId:'board:'+ask.id};
+  host.harness.sdk.stub('plugins.callRpc',async()=>({answer:'Approve',ok:true,...stamp}));
+  await host.harness.behavior.callRpc('resolveAsk',{threadId:'thr_cap',id:ask.id,resolution:'Approve',...stamp});
   for(const pr of [2371,2391]) assert.match(text(await tool(host,'firstmate_merge').execute({crewId:CREW,yes:true,pr},ctx)),/^Merged/);
  }finally{await host.harness.lifecycle.dispose();}
 });

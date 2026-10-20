@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import * as ownerAsksModule from "./owner-asks.ts";
-import { askLetterAnswer, askIdFromSourceEventId, choicesFromCrewReport, choicesFromDecisionNote, createOwnerAsks, crewQuestionText, formatAskCard, newAskId, packAnswers } from "./owner-asks.ts";
+import { askLetterAnswer, askIdFromSourceEventId, choicesFromCrewReport, choicesFromDecisionNote, createOwnerAsks, crewQuestionText, formatAskCard, formatAskRound, newAskId, packAnswers } from "./owner-asks.ts";
 import { formatBoard } from "./owner-board.ts";
 
 const NOW = Date.UTC(2026, 9, 7, 12, 0);
@@ -227,6 +227,60 @@ test("create refuses a question with no options; a blocker with no options is st
   assert.equal(blocker.options.length, 0);
 });
 
+const GRILL_ROUND = [
+  { question: "What is the goal of Reels?", options: [{ label: "Grow reach", value: "A" }, { label: "Convert sales", value: "B" }, { label: "Test ideas", value: "C" }], recommended: 0 },
+  { question: "Who is the audience?", options: [{ label: "Existing customers", value: "A" }, { label: "New viewers", value: "B" }, { label: "Both", value: "C" }], recommended: 1 },
+  { question: "How often should we post?", options: [{ label: "Daily", value: "A" }, { label: "Three times a week", value: "B" }, { label: "Weekly", value: "C" }], recommended: 1 },
+  { question: "What is the first series?", options: [{ label: "Product tips", value: "A" }, { label: "Customer stories", value: "B" }, { label: "Behind the scenes", value: "C" }], recommended: 2 },
+];
+
+test("formatAskRound prints numbered questions, marks the recommended option, and says how to answer", () => {
+  assert.equal(formatAskRound({ text: GRILL_ROUND[0]!.question, round: GRILL_ROUND }), [
+    "1. What is the goal of Reels?",
+    "✓ A. Grow reach",
+    "B. Convert sales",
+    "C. Test ideas",
+    "",
+    "2. Who is the audience?",
+    "A. Existing customers",
+    "✓ B. New viewers",
+    "C. Both",
+    "",
+    "3. How often should we post?",
+    "A. Daily",
+    "✓ B. Three times a week",
+    "C. Weekly",
+    "",
+    "4. What is the first series?",
+    "A. Product tips",
+    "B. Customer stories",
+    "✓ C. Behind the scenes",
+    "",
+    "Answer like 1A 2C, or 'yes' to accept all recommended.",
+  ].join("\n"));
+});
+
+test("a grilling round is one stored ask; partial answers keep it open and a full set closes it", () => {
+  const asks = createOwnerAsks(db());
+  const ask = asks.create({
+    id: "around", captain: "thr_cap", kind: "question", text: GRILL_ROUND[0]!.question,
+    options: [], round: GRILL_ROUND, createdAt: NOW,
+  });
+  assert.equal(ask.state, "open");
+  assert.equal(asks.get("around")?.round?.length, 4);
+  assert.equal(asks.listWaiting("thr_cap", NOW).length, 1);
+  const partial = asks.recordRoundAnswers("around", "thr_cap", [{ n: 1, choice: "A" }, { n: 2, choice: "New viewers" }], NOW);
+  assert.equal(partial?.complete, false);
+  assert.equal(asks.get("around")?.state, "open");
+  assert.deepEqual(asks.get("around")?.roundAnswers, { 1: "Grow reach", 2: "New viewers" });
+  const full = asks.recordRoundAnswers("around", "thr_cap", [{ n: 3, choice: "b" }, { n: 4, choice: "C" }], NOW + 1);
+  assert.equal(full?.complete, true);
+  assert.equal(full?.summary, "1A 2B 3B 4C");
+  assert.equal(asks.get("around")?.state, "answered");
+  assert.equal(asks.get("around")?.resolution, "1A 2B 3B 4C");
+  assert.equal(asks.listWaiting("thr_cap", NOW + 1).length, 0);
+});
+
 test("old ask databases migrate without losing open asks and unparsed decisions link from the board", () => {
   const database = db();
   database.exec(`CREATE TABLE owner_ask (id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL, recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL, resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER);
@@ -343,6 +397,158 @@ test("each skipped card waits until the captain is told, and is told once", () =
   asks.markSkipsTold(["a1", "a2"]);
   assert.deepEqual(asks.untoldSkips("thr_cap", NOW), []);
   assert.deepEqual(asks.untoldSkips("thr_cap", NOW + 60_000), [], "a skip whose time passed needs no notice");
+});
+
+test("an owner answer stays after captain cancel or reopen", () => {
+  const asks = createOwnerAsks(db());
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW, "owner");
+  assert.equal(asks.answeredByOwner("a1"), true);
+  asks.resolve("a1", "thr_cap", "cancelled", "Captain clearing old card", NOW + 1);
+  assert.equal(asks.answeredByOwner("a1"), true);
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 2);
+  assert.equal(asks.answeredByOwner("a1"), true);
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 3, "owner");
+  assert.equal(asks.answeredByOwner("a1"), true);
+});
+
+test("replaying the same owner choice keeps the original answer time", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW, "owner");
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner");
+  const row = database.prepare("SELECT resolution, at FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number };
+  assert.equal(row.resolution, "Approve");
+  assert.equal(row.at, NOW);
+});
+
+test("a new owner choice on the same card updates the answer time", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW, "owner");
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW + 30_000, "owner");
+  const row = database.prepare("SELECT resolution, at FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number };
+  assert.equal(row.resolution, "No");
+  assert.equal(row.at, NOW + 30_000);
+});
+
+test("the same owner choice after reopen updates the answer time", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW, "owner");
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 1);
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW + 30_000, "owner");
+  const row = database.prepare("SELECT resolution, at FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number };
+  assert.equal(row.resolution, "No");
+  assert.equal(row.at, NOW + 30_000);
+});
+
+test("replaying the same tapId keeps the original answer time", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  const tap = { tapId: "tg:1", answeredAt: NOW };
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 5_000, "owner", tap);
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 10_000);
+  assert.ok(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner", { tapId: "tg:1", answeredAt: NOW + 30_000 }));
+  assert.equal(asks.get("a1")?.state, "open");
+  const row = database.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number; tap_id: string };
+  assert.equal(row.resolution, "Approve");
+  assert.equal(row.at, NOW);
+  assert.equal(row.tap_id, "tg:1");
+});
+
+test("a stale tap from before reopen is refused and writes nothing", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW, "owner", { tapId: "tg:no", answeredAt: NOW });
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 10_000);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner", { tapId: "tg:old", answeredAt: NOW + 5_000 }), undefined);
+  assert.equal(asks.get("a1")?.state, "open");
+  const row = database.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number; tap_id: string };
+  assert.equal(row.resolution, "No");
+  assert.equal(row.at, NOW);
+  assert.equal(row.tap_id, "tg:no");
+});
+
+test("a genuine re-tap after reopen wins with its own tapId", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "No", NOW, "owner", { tapId: "tg:no", answeredAt: NOW });
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 10_000);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner", { tapId: "tg:new", answeredAt: NOW + 20_000 })?.resolution, "Approve");
+  const row = database.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number; tap_id: string };
+  assert.equal(row.resolution, "Approve");
+  assert.equal(row.at, NOW + 20_000);
+  assert.equal(row.tap_id, "tg:new");
+});
+
+test("a resolve without tapId does not renew a tap-identified answer", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW, "owner", { tapId: "tg:1", answeredAt: NOW });
+  asks.resolve("a1", "thr_cap", "open", "Ask owner again", NOW + 10_000);
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 30_000, "owner")?.state, "answered");
+  const row = database.prepare("SELECT resolution, at, tap_id FROM owner_ask_answer WHERE id=?").get("a1") as { resolution: string; at: number; tap_id: string };
+  assert.equal(row.resolution, "Approve");
+  assert.equal(row.at, NOW);
+  assert.equal(row.tap_id, "tg:1");
+});
+
+test("replaying the same tapId after reopen keeps the owner skip", () => {
+  const asks = createOwnerAsks(db());
+  const options = [{ label: "No", value: "no" }, { label: "Approve", value: "approve" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "approval", text: "Merge?", options, createdAt: NOW });
+  const stamp = { tapId: "board:repeat-skip", answeredAt: NOW };
+  asks.resolve("a1", "thr_cap", "answered", "Approve", NOW, "owner", stamp);
+  asks.resolve("a1", "thr_cap", "open", "Reopen", NOW + 100);
+  const until = NOW + 60_000;
+  assert.deepEqual(asks.defer(["a1"], "thr_cap", until).refused, []);
+  const before = asks.get("a1");
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Approve", NOW + 200, "owner", stamp), undefined);
+  assert.deepEqual(asks.get("a1"), before);
+});
+
+test("an unstamped owner answer still records follow-ups and does not stamp tap_id", () => {
+  const database = db();
+  const asks = createOwnerAsks(database);
+  const options = [{ label: "Yes", value: "yes" }, { label: "No", value: "no" }];
+  asks.create({ id: "a1", captain: "thr_cap", kind: "question", text: "Ship?", options, createdAt: NOW });
+  assert.equal(asks.resolve("a1", "thr_cap", "answered", "Yes", NOW, "owner")?.resolution, "Yes");
+  assert.equal(asks.answeredByOwner("a1"), true);
+  const row = database.prepare("SELECT tap_id, at FROM owner_ask_answer WHERE id=?").get("a1") as { tap_id: string | null; at: number };
+  assert.equal(row.tap_id, null);
+  assert.equal(row.at, NOW);
+  assert.equal(asks.pendingFollowUps().length, 2);
+});
+
+test("rows recorded before the stamp cutoff keep a grant mark", () => {
+  const database = db();
+  database.exec(`CREATE TABLE owner_ask (
+    id TEXT PRIMARY KEY, captain TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, options TEXT NOT NULL,
+    recommended INTEGER, default_at INTEGER, irreversible INTEGER NOT NULL, state TEXT NOT NULL,
+    resolution TEXT, created_at INTEGER NOT NULL, resolved_at INTEGER)`);
+  database.exec("CREATE TABLE owner_ask_answer (id TEXT PRIMARY KEY, source TEXT NOT NULL, resolution TEXT, at INTEGER, tap_id TEXT)");
+  database.prepare("INSERT INTO owner_ask VALUES ('old','thr_cap','approval','Merge?','[]',null,null,0,'answered','Approve',1,1)").run();
+  database.prepare("INSERT INTO owner_ask_answer VALUES ('old','owner','Approve',1,null)").run();
+  createOwnerAsks(database);
+  const row = database.prepare("SELECT tap_id, at FROM owner_ask_answer WHERE id=?").get("old") as { tap_id: string; at: number };
+  assert.equal(row.tap_id, "legacy:old");
+  assert.equal(row.at, 1);
 });
 
 test("a skipped card answered early is answered, and a reopened card is no longer skipped", () => {
