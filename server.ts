@@ -114,7 +114,7 @@ import { BB_PROVIDERS, chooseProfile, formatPickLine, latestBuilderModel, loadCr
 import { CODEX_MODEL, CREW_ROLES, crewExecution, modelPermissionRefusal } from "./owner/crew-roles.ts";
 import { DISPATCH_VERSION, PROOF_STEP, pipelineGates, proofStep } from "./owner/pipelines.ts";
 import { changeReach, type Reach } from "./owner/reach.ts";
-import { type LiveCheck, hostCanDrive, PROJECTS, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
+import { type LiveCheck, devCommandFor, devCommands, hostCanDrive, PROJECTS, PROOF_SURFACES, projectBriefLines, projectForName, projectForRepo, repoOf as prRepoOf, surfaceRefusal, surfaceWords, unlistedNote } from "./owner/projects.ts";
 import { createReleaseReadbacks, type ReleaseSource } from "./lib/release-readback.ts";
 import { cardSubject, keyFromEnvFile, ownerRules, ruleAnsweringCard } from "./lib/card-rules.ts";
 import { authFailure, nativeSpawnFailureOutput, signedIn, signInCommand, wakeCompletionRetryMs, withoutWakeWarning } from "./lib/action-guards.ts";
@@ -2527,7 +2527,7 @@ export default async function plugin(bb: BbPluginApi) {
     error: (w,error) => bb.log.warn(`Workstream ${w.id}: ${String(error)}`),
     supportsDevLink: async (id) => {
       const rule = projectForName(await projectLabel(id));
-      return rule?.proofSurface === "web" && !!rule.dev;
+      return rule?.proofSurface === "web" && devCommands(rule).length > 0;
     },
     provision: async (w) => {
       if (w.adoption) return provisionAdopted(w);
@@ -2590,10 +2590,12 @@ export default async function plugin(bb: BbPluginApi) {
       return !!repo && await workstreamCommand(repo, `if systemctl is-active --quiet ${shQuote(devUnit(w))}; then echo running; else echo stopped; fi`) === "running";
     },
     startDev: async (w) => {
-      const config = projectForName(await projectLabel(w.projectId))?.dev;
-      if (!config) throw new Error("Project has no web app dev command in owner/projects.json.");
-      const repo = w.repos.find((r) => config.repository === undefined || r.repository.toLowerCase() === config.repository.toLowerCase());
-      if (!repo) throw new Error("Dev command repository is absent from workstream.");
+      const rule = projectForName(await projectLabel(w.projectId));
+      if (devCommands(rule).length === 0) throw new Error("Project has no web app dev command in owner/projects.json.");
+      const picked = devCommandFor(rule, w.repos.map((r) => r.repository));
+      const repo = picked && w.repos.find((r) => r.repository === picked.repository);
+      if (!picked || !repo) throw new Error(`No dev command in owner/projects.json for ${w.repos.map((r) => r.repository).join(", ") || "this workstream"}.`);
+      const config = picked.command;
       try {
         const share = await workstreamCommand(repo, `bb connect expose ${w.devLink.port} --json`);
         const shareUrl = /https:\/\/[^\s"<>]+/.exec(share)?.[0];
@@ -2719,11 +2721,24 @@ export default async function plugin(bb: BbPluginApi) {
     },
     // Owner decision Q3 (20 Oct): an adopted crew's uncommitted work becomes a backup commit on its own branch
     // before its fold, and its commits are pushed to its wip branch, so its old worktree holds nothing unsaved.
-    saveWork: async (w, job) => {
-      if (job.sourceBranch) return;
+    // Under the crew's lifecycle lock, and only after its thread and worktree are read again: a crew that
+    // resumed keeps a running job, and nothing is committed in its worktree until it finishes.
+    saveWork: async (w, job) => job.sourceBranch ? undefined : crewControl(job.id, async () => {
       const checkout = job.repos?.[0];
       const repo = w.repos.find((r) => r.repository.toLowerCase() === (checkout?.repository ?? job.repository ?? "").toLowerCase()) ?? w.repos[0];
       if (!checkout?.path || !repo) return job.branch ? { sourceBranch: job.branch } : { wait: "its work has no worktree and no branch" };
+      const threadId = (await readCrews()).find((c) => c.id === job.id)?.threadId ?? job.threadId;
+      if (threadId) {
+        let thread: Record<string, unknown>;
+        try { thread = asRecord(await bb.sdk.threads.get({ threadId })); }
+        catch (error) { return { wait: `its crew thread is unreadable (${error instanceof Error ? error.message : String(error)})` }; }
+        if (thread["archivedAt"] == null) {
+          if (threadRunning(thread)) return { running: threadId };
+          const envId = typeof thread["environmentId"] === "string" ? thread["environmentId"] : null;
+          const path = envId ? asRecord(await bb.sdk.environments.get({ environmentId: envId }).catch(() => ({})))["path"] : undefined;
+          if (typeof path === "string" && path && path !== checkout.path) return { wait: "its crew now works in another worktree" };
+        }
+      }
       const host = { hostId: checkout.hostId || repo.hostId };
       const saved = parseSavedWork(await workstreamCommand(host, `bash -c ${shQuote(saveWorkScript(checkout.path, `Backup of unsaved work before folding into ${repo.branch}`))}`));
       if (saved.missing) return job.branch ? { sourceBranch: job.branch } : { wait: "its worktree is gone and it has no branch" };
@@ -2731,7 +2746,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (saved.committed) bb.log.info(`workstream ${w.id}: backup commit ${saved.head?.slice(0, 7)} of crew ${job.id} before its fold`);
       const pushed = parseWipBackup(await workstreamCommand(host, `bash -c ${shQuote(wipBackupScript(checkout.path, job.id, repo.base ?? "main"))}`));
       if (pushed.push === "failed" || pushed.push === "no-remote") bb.log.warn(`workstream ${w.id}: crew ${job.id} work not pushed (${pushed.push} ${truncate(pushed.detail, 200)}); its old worktree stays as unsaved work`);
-    },
+      return undefined;
+    }),
     // A conflict the new crew could not merge safely: the task stays separate and the owner gets one question.
     separate: async (w, job, reason) => {
       const task = job.taskId ? ownerTasks.get(job.taskId) : undefined;
@@ -2793,10 +2809,10 @@ export default async function plugin(bb: BbPluginApi) {
       const repo = w.repos[0];
       if (repo) await workstreamCommand(repo, `if [ "$(systemctl show -p LoadState --value ${shQuote(devUnit(w))})" != not-found ]; then systemctl stop ${shQuote(devUnit(w))}; fi`);
       w.devLink.state = "stopped";
-      const config = projectForName(await projectLabel(w.projectId))?.dev;
-      if (!config) return;
-      const target = w.repos.find((r) => config.repository === undefined || r.repository.toLowerCase() === config.repository.toLowerCase()) ?? repo;
-      if (!target) return;
+      const picked = devCommandFor(projectForName(await projectLabel(w.projectId)), w.repos.map((r) => r.repository));
+      const target = picked && w.repos.find((r) => r.repository === picked.repository);
+      if (!picked || !target) return;
+      const config = picked.command;
       w.devLink.state = "starting";
       try {
         const share = await workstreamCommand(target, `bb connect expose ${w.devLink.port} --json`);
@@ -2913,6 +2929,14 @@ export default async function plugin(bb: BbPluginApi) {
     && JSON.stringify([...a.tasks].sort((x, y) => x.taskId.localeCompare(y.taskId))) === JSON.stringify([...b.tasks].sort((x, y) => x.taskId.localeCompare(y.taskId)))
     && JSON.stringify([...a.replacesPrs].sort()) === JSON.stringify([...b.replacesPrs].sort());
   const approvedAnswer = (resolution: string | null | undefined) => ["approve", "approved"].includes((resolution ?? "").trim().toLowerCase());
+  /** The adopt request whose card the owner himself approved, or undefined. */
+  async function approvedAdoptRequest(requestKey: string): Promise<AdoptRequest | undefined> {
+    const askId = await bb.storage.kv.get<string>(requestKey);
+    if (typeof askId !== "string") return undefined;
+    const ask = ownerAsks.get(askId);
+    if (ask?.state !== "answered" || !approvedAnswer(ask.resolution) || !ownerAsks.answeredByOwner(askId)) return undefined;
+    return bb.storage.kv.get<AdoptRequest>(`${ADOPT_CARD_PREFIX}${askId}`);
+  }
 
   async function prHeadBranch(url: string | undefined, hostId: string): Promise<string | undefined> {
     if (!url) return undefined;
@@ -2928,7 +2952,7 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function adoptSources(req: AdoptRequest): Promise<{ sources: Array<AdoptSource & { title?: string }>; repositories: string[]; replaces: Array<{ url: string; repository: string }> }> {
     const rule = projectForName(await projectLabel(req.projectId));
-    const fallback = rule?.dev?.repository ?? rule?.repos.find((pattern) => !pattern.includes("*"));
+    const fallback = devCommands(rule).find((c) => c.repository)?.repository ?? rule?.repos.find((pattern) => !pattern.includes("*"));
     const crews = await readCrews();
     // Only reads happen here; a crew's own environment names its host, so a captain without one still gets its card.
     const hostId = await resolveHostForProject(req.projectId, req.threadId).catch(() => "");
@@ -2951,28 +2975,48 @@ export default async function plugin(bb: BbPluginApi) {
       if (!repositories.some((r) => r.toLowerCase() === repository.toLowerCase())) repositories.push(repository);
       const repointedFrom = named?.repository && recorded && recorded.toLowerCase() !== named.repository.toLowerCase() ? recorded : undefined;
       const common = { taskId, repository, title: task.title, ...(repointedFrom ? { repointedFrom } : {}) };
-      if (named?.branches?.length) {
-        named.branches.forEach((branch, i) => {
-          const crew = builders[i];
-          sources.push({ ...common, crewId: crew?.id ?? `${taskId}-${i + 1}`, threadId: crew?.threadId ?? null, from: "branch", branch, running: false });
-        });
-        continue;
-      }
-      for (const crew of builders) {
+      // Each builder crew's checkout, read now: a live worktree of the task's repository is folded from there,
+      // after its unsaved work is saved; a worktree that is gone or holds another repository is not.
+      type Checkout = { path: string; envId: string | null; host: string; branch: string };
+      const checkouts = new Map<string, { checkout: Checkout | null; running: boolean }>();
+      const checkoutOf = async (crew: Crew) => {
+        if (checkouts.has(crew.id)) return checkouts.get(crew.id)!;
         let thread: Record<string, unknown> | null = null;
         try { thread = asRecord(await bb.sdk.threads.get({ threadId: crew.threadId })); } catch { thread = null; }
         const live = thread !== null && thread["archivedAt"] == null;
-        const running = live && threadRunning(thread!);
         const envId = live && typeof thread!["environmentId"] === "string" ? thread!["environmentId"] : null;
         let env: Record<string, unknown> | null = null;
         if (envId) { try { env = asRecord(await bb.sdk.environments.get({ environmentId: envId })); } catch { env = null; } }
         const path = env && env["isWorktree"] !== false && typeof env["path"] === "string" ? env["path"] : "";
-        const envHost = typeof env?.["hostId"] === "string" && env["hostId"] ? env["hostId"] : hostId;
+        const host = typeof env?.["hostId"] === "string" && env["hostId"] ? env["hostId"] : hostId;
         const branch = (typeof env?.["branchName"] === "string" && env["branchName"]) || crew.branch || "";
-        if (path && (await originOf(path, envHost)).toLowerCase() === repository.toLowerCase()) {
-          sources.push({ ...common, crewId: crew.id, threadId: crew.threadId, from: "worktree", branch, path, environmentId: envId, hostId: envHost, running });
-          continue;
+        const own = !!path && (await originOf(path, host)).toLowerCase() === repository.toLowerCase();
+        const found = { checkout: own ? { path, envId, host, branch } : null, running: live && threadRunning(thread!) };
+        checkouts.set(crew.id, found);
+        return found;
+      };
+      const fromCheckout = (crew: Crew, co: Checkout, running: boolean) => ({
+        ...common, crewId: crew.id, threadId: crew.threadId, from: "worktree" as const, branch: co.branch, path: co.path, environmentId: co.envId, hostId: co.host, running,
+      });
+      if (named?.branches?.length) {
+        const used = new Set<string>();
+        for (const [i, branch] of named.branches.entries()) {
+          let matched: Crew | undefined;
+          for (const crew of builders) {
+            if (used.has(crew.id)) continue;
+            const { checkout, running } = await checkoutOf(crew);
+            if (checkout && checkout.branch === branch) { matched = crew; sources.push(fromCheckout(crew, checkout, running)); break; }
+          }
+          if (matched) { used.add(matched.id); continue; }
+          const crew = builders[i] && !used.has(builders[i]!.id) ? builders[i] : undefined;
+          if (crew) used.add(crew.id);
+          sources.push({ ...common, crewId: crew?.id ?? `${taskId}-${i + 1}`, threadId: crew?.threadId ?? null, from: "branch", branch, running: false });
         }
+        continue;
+      }
+      for (const crew of builders) {
+        const { checkout, running } = await checkoutOf(crew);
+        if (checkout) { sources.push(fromCheckout(crew, checkout, running)); continue; }
         if (running) throw new Error(`Cannot adopt task ${taskId}: crew ${crew.id} is still working outside ${repository}. Name its pushed branch with tasks[].branches, or adopt after it finishes.`);
         const pushed = crew.branch ?? await prHeadBranch(crew.prUrl ?? task.prs[0], hostId);
         if (!pushed) throw new Error(`Cannot adopt task ${taskId}: crew ${crew.id} has no worktree and no known branch. Name its pushed branch with tasks[].branches.`);
@@ -3032,18 +3076,20 @@ export default async function plugin(bb: BbPluginApi) {
     }
     for (const named of input.tasks ?? []) if (!taskIds.includes(named.taskId)) throw new Error(`tasks names ${named.taskId}, which is not in taskIds.`);
     const req: AdoptRequest = { threadId: input.threadId, projectId: input.projectId, name: input.name.trim(), requestId: input.requestId, taskIds, tasks: input.tasks ?? [], replacesPrs: [...new Set(input.replacesPrs ?? [])] };
+    const requestKey = adoptRequestKey(input.threadId, req.requestId);
     const existing = workstreams.list(input.threadId, true).find((w) => w.requestId === req.requestId);
     if (existing) {
-      // After the owner's Approve, a retry of the same request continues the same workstream.
-      if (!existing.adoption || existing.name !== req.name || existing.projectId !== req.projectId || JSON.stringify([...existing.adoption.taskIds].sort()) !== JSON.stringify([...taskIds].sort())) {
-        throw new Error("Adopt retry changed its original name, project or task list.");
+      // After the owner's Approve, a retry continues the same workstream with the request he approved, never
+      // with changed repositories, branches or replaced PRs: those need a new card.
+      const approved = await approvedAdoptRequest(requestKey);
+      if (!existing.adoption || !approved || !sameAdoptRequest(approved, req)) {
+        throw new Error("Adopt retry changed its original name, project, task list, repositories, branches or replaced PRs. Adopt again with a new requestId for a new owner card.");
       }
-      return { workstream: await adoptApproved(req) };
+      return { workstream: await adoptApproved(approved) };
     }
     for (const taskId of taskIds) {
       if (workstreams.listAll().some((w) => w.taskIds.includes(taskId))) throw new Error(`Task ${taskId} already belongs to a workstream.`);
     }
-    const requestKey = adoptRequestKey(input.threadId, req.requestId);
     const known = await bb.storage.kv.get<string>(requestKey);
     if (typeof known === "string") {
       const bound = await bb.storage.kv.get<AdoptRequest>(`${ADOPT_CARD_PREFIX}${known}`);

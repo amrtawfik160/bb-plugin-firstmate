@@ -25,12 +25,15 @@ export type LiveRule = {
   /** Backend files whose change must be deployed too: a PR that touches `paths` needs a backend check to prove it. */
   backend?: { paths: readonly string[]; what: string; checks: readonly LiveCheck[]; missing: string; repos?: readonly string[] };
 };
+/** How a workstream's dev link starts its web app: `{port}` and `{source}` are filled in. */
+export type DevCommand = { command: string; repository?: string };
 export type ProjectRule = {
   name: string;
   repos: readonly string[];
   bbProjects?: readonly string[];
   proofSurface: ProofSurface;
-  dev?: { command: string; repository?: string };
+  /** One dev command, or one per repository (Reels work lives in the Cyndra project). */
+  dev?: DevCommand | readonly DevCommand[];
   release?: { kind: "testflight"; group: string };
   sharedServers?: readonly SharedServer[];
   live?: LiveRule;
@@ -66,6 +69,24 @@ export function projectForName(name: string | null | undefined, table: ProjectTa
   const first = (text: string) => text.trim().split(/\s+/)[0]!.toLowerCase();
   return table.projects.find((project) => [project.name, ...(project.bbProjects ?? [])].some((known) => known.toLowerCase() === clean))
     ?? table.projects.find((project) => first(project.name) === first(clean));
+}
+
+/** The project's dev commands: one per repository, or the older single entry. */
+export function devCommands(rule: Pick<ProjectRule, "dev"> | undefined): DevCommand[] {
+  const dev = rule?.dev;
+  if (dev === undefined) return [];
+  return Array.isArray(dev) ? [...(dev as readonly DevCommand[])] : [dev as DevCommand];
+}
+
+/** The dev command for a workstream's repositories: one naming the repository first, else one for any repository. */
+export function devCommandFor(rule: Pick<ProjectRule, "dev"> | undefined, repositories: readonly string[]): { command: DevCommand; repository: string } | undefined {
+  const commands = devCommands(rule);
+  for (const repository of repositories) {
+    const named = commands.find((c) => c.repository !== undefined && c.repository.toLowerCase() === repository.toLowerCase());
+    if (named) return { command: named, repository };
+  }
+  const any = commands.find((c) => c.repository === undefined);
+  return any && repositories[0] !== undefined ? { command: any, repository: repositories[0] } : undefined;
 }
 
 export function surfaceWords(surface: ProofSurface, table: ProjectTable = PROJECTS): string {

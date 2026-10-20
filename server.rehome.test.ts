@@ -389,3 +389,116 @@ test('the captain proposes groups per project, workstreams work in every project
     } finally { await h.host.harness.lifecycle.dispose(); }
   } finally { rmSync(w.dir, { recursive: true, force: true }); }
 });
+
+// Check round 1 of PR #182 (VERDICT-REHOME-FM-1.md): the checker's probes, each defect assertion stating the safe outcome.
+async function probeWorld() {
+  const w = await world();
+  const repository = 'Cyndra-AI/cyndra-saas';
+  const project = { id: 'cyndra', name: 'Cyndra SaaS', source: join(w.dir, 'src', 'cyndra') };
+  w.remote(repository); mkdirSync(join(w.dir, 'src'));
+  const seed = w.clone(repository, join(w.dir, 'seed'));
+  writeFileSync(join(seed, 'base.txt'), 'base\n'); commitAll(seed, 'base'); git(seed, 'push', '-q', 'origin', 'HEAD:main');
+  w.clone(repository, project.source);
+  const h = await rehomeHost(w, [project]);
+  const add = async (id: string, status = 'idle', conflict?: string) => {
+    const tree = join(w.dir, id);
+    const branch = `fm/${id}`;
+    git(project.source, 'worktree', 'add', '-q', '-b', branch, tree, 'origin/main');
+    writeFileSync(join(tree, conflict ? 'base.txt' : `${id}.txt`), conflict ?? id);
+    commitAll(tree, id); git(tree, 'push', '-q', 'origin', branch);
+    h.envs.set(`env_${id}`, { path: tree, branch });
+    await h.crew(id, project.id, `thr_${id}`, { status, envId: `env_${id}` }, { branch, environmentId: `env_${id}` });
+    const task = h.open(id, project, id);
+    return { tree, branch, task, head: git(tree, 'rev-parse', 'HEAD') };
+  };
+  const done = async () => { await h.host.harness.lifecycle.dispose(); rmSync(w.dir, { recursive: true, force: true }); };
+  return { w, h, add, done, repository, project };
+}
+
+test('check round 1: a named pushed branch keeps its crew worktree as the source and folds its unsaved files', async () => {
+  const p = await probeWorld();
+  try {
+    const a = await p.add('a');
+    writeFileSync(join(a.tree, 'unsaved.txt'), 'owner work');
+    const { workstream } = await adoptByCard(p.h, { projectId: p.project.id, name: 'Explicit branch', requestId: 'explicit', taskIds: [a.task.id], tasks: [{ taskId: a.task.id, branches: [a.branch] }] });
+    assert.equal(existsSync(join(workstream.repos[0].path, 'unsaved.txt')), true, 'all unsaved crew work must be backed up and folded');
+  } finally { await p.done(); }
+});
+
+test('check round 1: a retry cannot fold an extra branch that the owner never approved', async () => {
+  const p = await probeWorld();
+  try {
+    const a = await p.add('a');
+    const input = { projectId: p.project.id, name: 'Retry', requestId: 'retry', taskIds: [a.task.id], tasks: [{ taskId: a.task.id, branches: [a.branch] }] };
+    const { workstream } = await adoptByCard(p.h, input);
+    const extra = join(p.w.dir, 'extra');
+    git(p.project.source, 'worktree', 'add', '-q', '-b', 'fm/unapproved', extra, 'origin/main');
+    writeFileSync(join(extra, 'unapproved.txt'), 'extra work'); commitAll(extra, 'unapproved'); git(extra, 'push', '-q', 'origin', 'fm/unapproved');
+    await p.h.call('workstreams.adopt', { threadId: 'cap', ...input, tasks: [{ taskId: a.task.id, branches: [a.branch, 'fm/unapproved'] }] }).catch(() => ({}));
+    assert.equal(existsSync(join(workstream.repos[0].path, 'unapproved.txt')), false, 'changed branch list must require new approval or be refused');
+  } finally { await p.done(); }
+});
+
+test('check round 1: a crew that resumes during provisioning gets no backup commit while it runs', async () => {
+  const p = await probeWorld();
+  try {
+    const a = await p.add('a');
+    writeFileSync(join(a.tree, 'in-progress.txt'), 'still editing');
+    let resumed = false;
+    p.h.host.harness.sdk.stub('hosts.exec', async ({ command }: { command: string }) => {
+      p.h.commands.push(command);
+      if (command.includes('git worktree add')) { resumed = true; p.h.threads.set('thr_a', { status: 'active', envId: 'env_a' }); }
+      const run = spawnSync('bash', ['-c', command], { encoding: 'utf8', env: gitEnv, cwd: p.w.dir, timeout: 60_000 });
+      return { exitCode: run.status ?? 1, output: run.status === 0 ? run.stdout : `${run.stdout}${run.stderr}` };
+    });
+    await adoptByCard(p.h, { projectId: p.project.id, name: 'Resume', requestId: 'resume', taskIds: [a.task.id] });
+    assert.ok(resumed);
+    assert.equal(git(a.tree, 'rev-parse', 'HEAD'), a.head, 'must hold lifecycle lock and re-read crew status before committing in its worktree');
+  } finally { await p.done(); }
+});
+
+test('check round 1: a later finished crew does not fold into the worktree of a running conflict crew', async () => {
+  const p = await probeWorld();
+  try {
+    const a = await p.add('a', 'idle', 'change a\n');
+    const b = await p.add('b', 'idle', 'change b\n');
+    const c = await p.add('c', 'active');
+    const { workstream } = await adoptByCard(p.h, { projectId: p.project.id, name: 'Resolver active', requestId: 'resolver', taskIds: [a.task.id, b.task.id, c.task.id] });
+    const repo = workstream.repos[0];
+    const resolver = workstream.jobs.find((j: Row) => j['resolves']);
+    assert.ok(resolver); assert.equal(resolver.state, 'running');
+    const before = git(repo.path, 'rev-parse', 'HEAD');
+    p.h.threads.set('thr_c', { status: 'idle', envId: 'env_c' });
+    await p.h.host.harness.behavior.runSchedule('workstreams');
+    const after = git(repo.path, 'rev-parse', 'HEAD');
+    assert.equal(after, before, 'running resolver exclusively owns its workstream worktree');
+  } finally { await p.done(); }
+});
+
+test('check round 1: a running adopted crew whose thread ends in error still folds its saved work', async () => {
+  const p = await probeWorld();
+  try {
+    const a = await p.add('a', 'active');
+    const { workstream } = await adoptByCard(p.h, { projectId: p.project.id, name: 'Error end', requestId: 'error', taskIds: [a.task.id] });
+    p.h.threads.set('thr_a', { status: 'error', envId: 'env_a' });
+    await p.h.host.harness.behavior.runSchedule('workstreams');
+    const rows = await p.h.call('workstreams.list', { threadId: 'cap' }) as any;
+    const actual = rows.workstreams.find((w: Row) => w['id'] === workstream.id);
+    assert.equal(actual.jobs[0].state, 'folded', 'an ended adopted crew saved work must not be stranded');
+  } finally { await p.done(); }
+});
+
+test('check round 1: an adopted crew that recovers from an error and finishes still folds its saved work', async () => {
+  const p = await probeWorld();
+  try {
+    const a = await p.add('a', 'active');
+    const { workstream } = await adoptByCard(p.h, { projectId: p.project.id, name: 'Error end', requestId: 'error', taskIds: [a.task.id] });
+    p.h.threads.set('thr_a', { status: 'error', envId: 'env_a' });
+    await p.h.host.harness.behavior.runSchedule('workstreams');
+    p.h.threads.set('thr_a', { status: 'idle', envId: 'env_a' });
+    await p.h.host.harness.behavior.runSchedule('workstreams');
+    const rows = await p.h.call('workstreams.list', { threadId: 'cap' }) as any;
+    const actual = rows.workstreams.find((w: Row) => w['id'] === workstream.id);
+    assert.equal(actual.jobs[0].state, 'folded', 'an ended adopted crew saved work must not be stranded');
+  } finally { await p.done(); }
+});

@@ -80,9 +80,10 @@ export type WorkstreamDeps = {
   card?: (w: Workstream) => Promise<void>;
   /**
    * Before an adopted crew's work folds: save its uncommitted work as a backup commit and push it. `wait`
-   * holds the fold; `sourceBranch` folds that pushed branch because the crew's worktree is gone.
+   * holds the fold; `sourceBranch` folds that pushed branch because the crew's worktree is gone; `running`
+   * names the crew's thread when it works again, so its job runs and nothing is saved or folded yet.
    */
-  saveWork?: (w: Workstream, job: WorkstreamJob) => Promise<void | { wait: string } | { sourceBranch: string }>;
+  saveWork?: (w: Workstream, job: WorkstreamJob) => Promise<void | { wait: string } | { sourceBranch: string } | { running: string }>;
   /** A conflict the new crew could not merge safely: the task stays separate and the owner gets one question. */
   separate?: (w: Workstream, job: WorkstreamJob, reason: string) => Promise<void>;
   signal?: AbortSignal;
@@ -106,6 +107,12 @@ function adoptedJob(source: AdoptSource & { title?: string }, projectId: string)
 }
 
 type JobSubmit = Pick<WorkstreamJob, 'id' | 'editing' | 'payload'> & Partial<Pick<WorkstreamJob, 'taskId' | 'followUpOf' | 'title' | 'model' | 'environmentId' | 'path' | 'branch' | 'repos' | 'repository' | 'baseBranch'>>;
+
+/** A crew that edits in the workstream worktree itself (a conflict crew, or an editor from before task
+ * worktrees) is working there: folds, fold undos and Ship leave that worktree alone until it finishes. */
+function sharedEditorActive(w: Pick<Workstream, 'jobs'>): boolean {
+  return w.jobs.some((j) => j.editing && !j.isolated && (j.state === 'running' || j.state === 'starting'));
+}
 
 function keptUnsaved(job: WorkstreamJob): boolean {
   return job.state === 'kept-unsaved' || job.cleanup === 'kept-unsaved';
@@ -421,7 +428,9 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       }
       const status = job.threadId ? await deps.status(job.threadId) : 'unknown';
       if (status === 'idle' || status === 'archived' || status === 'error' || status === 'failed') {
-        if (job.isolated && (status === 'error' || status === 'failed' || status === 'archived')) {
+        // An adopted crew's saved work is never stranded: an ended or erroring crew still has its work saved and
+        // folded, and the save reads the crew again first, so one that resumed keeps running.
+        if (job.isolated && !job.adopted && (status === 'error' || status === 'failed' || status === 'archived')) {
           job.state = 'failed';
           job.failedAt = deps.now();
         } else {
@@ -435,14 +444,14 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
     for (const job of w.jobs) {
       if (deps.signal?.aborted) return;
       if (job.fold?.state === 'committed') await finishFold(w, job);
-      else if (job.state === 'folding') await recoverFold(w, job);
+      else if (job.state === 'folding' && !sharedEditorActive(w)) await recoverFold(w, job);
     }
     for (const resolver of w.jobs.filter((j) => j.resolves && j.state === 'finished')) {
       if (deps.signal?.aborted) return;
       await checkResolved(w, resolver);
     }
     // One fold at a time: an undo that has to wait holds later folds, whose merges would move the branch.
-    if (created && w.ship.state !== 'running' && !w.jobs.some((j) => j.state === 'folding')) {
+    if (created && w.ship.state !== 'running' && !w.jobs.some((j) => j.state === 'folding') && !sharedEditorActive(w)) {
       for (const job of w.jobs.filter((j) => j.isolated && j.state === 'finished' && !j.resolver)) {
         if (deps.signal?.aborted) return;
         if (job.adopted) {
@@ -451,6 +460,13 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
           let saved: Awaited<ReturnType<NonNullable<WorkstreamDeps['saveWork']>>>;
           try { saved = await deps.saveWork?.(w, job); }
           catch (error) { deps.error?.(w, error); saved = { wait: 'its unsaved work could not be saved yet' }; }
+          if (saved && 'running' in saved) {
+            job.state = 'running';
+            job.threadId = saved.running;
+            delete job.note;
+            await bumpCard(w);
+            continue;
+          }
           if (saved && 'wait' in saved) {
             if (job.note !== `waiting: ${saved.wait}`) await waitToFold(w, job, saved.wait);
             continue;
@@ -748,9 +764,9 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
           if (!told) await deps.waiting?.(w);
           return w;
         }
-      } else if (w.jobs.some((j) => j.state === 'folding')) {
+      } else if (w.jobs.some((j) => j.state === 'folding') || sharedEditorActive(w)) {
         const told = w.ship.state === 'queued' && w.ship.requestId === requestId;
-        w.ship = { state: 'queued', requestId, error: 'Ship waits until the current fold finishes.' };
+        w.ship = { state: 'queued', requestId, error: sharedEditorActive(w) ? 'Ship waits until the crew working in the workstream worktree finishes.' : 'Ship waits until the current fold finishes.' };
         save(w);
         if (!told) await deps.waiting?.(w);
         return w;
@@ -773,7 +789,7 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
         if (w.ship.state === 'queued') {
           if (isAdoptedWorkstream(w)) {
             if (await (deps.editorBusy ?? deps.busy)?.(w)) continue;
-          } else if (w.jobs.some((j) => j.state === 'folding')) continue;
+          } else if (w.jobs.some((j) => j.state === 'folding') || sharedEditorActive(w)) continue;
           beginShip(w, w.ship.requestId ?? '');
         }
         if (w.ship.state === 'running') {

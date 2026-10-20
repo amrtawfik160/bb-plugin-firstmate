@@ -299,3 +299,35 @@ test('a new topic replaces a recorded topic only when the caller names the recor
     assert.deepEqual((await f.store.bindTopic(other.id, 'cap', { chatId: '200', topicId: 11 })).topic, { chatId: '200', topicId: 11 });
   } finally { f.db.close(); }
 });
+
+test('Ship and later folds wait while a conflict crew works in the workstream worktree, then go on', async () => {
+  const f = fixture();
+  let ships = 0;
+  f.deps.ship = async () => { ships++; };
+  try {
+    f.conflicts.add('t-idle1');
+    f.statuses.set('run2', 'active');
+    const w = await f.store.adoptFold(adoptInput([
+      source({ taskId: 'T1', crewId: 'idle1', branch: 'fm/idle1' }),
+      source({ taskId: 'T2', crewId: 'run2', branch: 'fm/run2', running: true }),
+    ]));
+    const resolver = f.store.get(w.id, 'cap').jobs.find((j) => j.resolves === 'idle1')!;
+    assert.equal(resolver.state, 'running');
+    // The other crew finishes while the conflict crew works: its fold waits.
+    f.statuses.set('run2', 'idle');
+    await f.store.reconcile();
+    assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'run2')!.state, 'finished');
+    assert.equal(f.merged.includes('t-run2'), false);
+    const queued = await f.store.ship(w.id, 'cap', 'ship-1');
+    assert.equal(queued.ship.state, 'queued');
+    assert.match(queued.ship.error ?? '', /crew working in the workstream worktree/);
+    assert.equal(ships, 0);
+    // The conflict crew merged and finished: the waiting fold lands, then the queued Ship runs.
+    f.landed.add('t-idle1');
+    f.statuses.set(resolver.id, 'idle');
+    await f.store.reconcile();
+    const after = f.store.get(w.id, 'cap');
+    assert.equal(after.jobs.find((j) => j.id === 'run2')!.state, 'folded');
+    assert.equal(ships, 1);
+  } finally { f.db.close(); }
+});
