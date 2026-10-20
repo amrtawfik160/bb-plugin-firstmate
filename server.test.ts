@@ -58,6 +58,7 @@ import plugin, {
   toolbeltPhrase,
   versionAtLeast,
   overlayFingerprint,
+  ghReadCommand,
 } from "./server.ts";
 import { LEFTOVER_TIMER_CONTRACT, WAITING_PROTOCOL, latestStatus, statusProtocolSummary } from "./lib/policy.ts";
 import { UPSTREAM_SCRIPT_NAMES, PINNED_SCRIPT_SUPPORT_FILES, UPSTREAM_SKILL_NAMES } from "./lib/upstream-surface.ts";
@@ -742,6 +743,43 @@ test("host command in a terminal never waits in a pager: a fold's long git diff 
     assert.equal(run.error, undefined, "the command waited in a pager");
     assert.match(run.stdout, /\n__FM_HOST_RC:0\r?\n/);
     assert.equal((run.stdout.match(/^f\d+\r?$/gm) ?? []).length, 80, "every changed file is printed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a gh read in a terminal returns only gh's JSON and keeps gh's exit code (Cyndra PR 2581, 20 Oct)", { skip: spawnSync("script", ["--version"]).status !== 0 && "needs util-linux script for a pseudo-terminal" }, async () => {
+  const host = createFakePluginHost({
+    pluginId: "firstmate",
+    agentSkillIds: SKILLS,
+    settings: { fmHome: "/tmp/fm-home", fullParityOnDeck: false },
+  });
+  await plugin(host.bb); stubProviderCatalog(host);
+  const dir = mkdtempSync(join(tmpdir(), "fm-gh-read-"));
+  try {
+    stubCaptainDeck(host);
+    await host.harness.behavior.setSettings({ fmHostId: "host_1" });
+    stubRoutedHost(host, () => ({}));
+    await host.harness.behavior.runCli(["deck"], { threadId: "thr_cap", projectId: "proj_1" });
+    const created = host.harness.sdk.callsTo("terminals.create")[0]?.[0] as { start: { command: string } } | undefined;
+    assert.ok(created, "deck ran a host command");
+    // Like gh: a progress line on stderr only when stdout is a terminal, then the JSON on stdout.
+    const gh = join(dir, "gh");
+    writeFileSync(gh, `#!/bin/sh\n[ -t 1 ] && echo Working... >&2\necho '{"state":"CLOSED"}'\nexit "\${GH_STUB_EXIT:-0}"\n`, { mode: 0o755 });
+    const read = (exit: string) => {
+      const envelope = created.start.command
+        .replace(/^__fm_cmd='[\s\S]*?'; set \+e; /, `__fm_cmd='${ghReadCommand(`${gh} pr view 2581 --json state`).replace(/'/g, "'\\''")}'; set +e; `)
+        .replace(/; sleep \d+$/, "");
+      const run = spawnSync("script", ["-qec", envelope, "/dev/null"], { encoding: "utf8", timeout: 8000, env: { ...process.env, SHELL: "/bin/bash", TERM: "xterm", GH_STUB_EXIT: exit } });
+      assert.equal(run.error, undefined);
+      const [output, rc] = run.stdout.split(/\r?\n__FM_HOST_RC:/);
+      return { output: output!.trim(), rc: Number.parseInt(rc ?? "", 10) };
+    };
+    const ok = read("0");
+    assert.equal(ok.rc, 0);
+    assert.deepEqual(JSON.parse(ok.output), { state: "CLOSED" }, "no progress line in the parsed output");
+    assert.equal(read("1").rc, 1, "gh's failure is not hidden by the pipe");
   } finally {
     rmSync(dir, { recursive: true, force: true });
     await host.harness.lifecycle.dispose();
