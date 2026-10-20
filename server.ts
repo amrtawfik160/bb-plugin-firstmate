@@ -15033,7 +15033,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
         const title = question?.trim() ?? "";
         const storedText = title || roundQuestions[0]!.question;
-        const roundImpact = impact?.replace(/\s+/g, " ").trim().slice(0, 300);
+        const roundImpact = impact?.replace(/\s+/g, " ").trim();
         const formatted = formatAskRound({ text: storedText, ...(roundImpact ? { impact: roundImpact } : {}), round: roundQuestions });
         if (formatted.length > ASK_ROUND_MAX_CHARS) {
           return toolError("Refusing: the grilling round is longer than one Telegram message (3000 characters). Shorten the questions. Nothing was sent.");

@@ -404,7 +404,11 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       id TEXT PRIMARY KEY, told INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS owner_ask_round (id TEXT PRIMARY KEY, questions TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS owner_ask_round_answer (
-      id TEXT NOT NULL, idx INTEGER NOT NULL, label TEXT NOT NULL, PRIMARY KEY (id, idx));`);
+      id TEXT NOT NULL, idx INTEGER NOT NULL, label TEXT NOT NULL, choice INTEGER, PRIMARY KEY (id, idx));`);
+  {
+    const roundAnswerCols = new Set((db.prepare("PRAGMA table_info(owner_ask_round_answer)").all() as Array<{ name: string }>).map((row) => row.name));
+    if (!roundAnswerCols.has("choice")) db.exec("ALTER TABLE owner_ask_round_answer ADD COLUMN choice INTEGER");
+  }
   {
     const cols = new Set((db.prepare("PRAGMA table_info(owner_ask_followup)").all() as Array<{ name: string }>).map((row) => row.name));
     if (!cols.has("attempts")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
@@ -612,23 +616,32 @@ export function createOwnerAsks(db: Database): OwnerAsks {
         if (current.round === undefined || current.round.length === 0) {
           return { ask: current, complete: false, summary: "", error: "Ask is not a grilling round." };
         }
+        const round = current.round;
+        const storedChoice = Object.fromEntries(
+          (db.prepare("SELECT idx, choice FROM owner_ask_round_answer WHERE id=?").all(id) as Array<{ idx: number; choice: number | null }>)
+            .filter((row): row is { idx: number; choice: number } => typeof row.choice === "number" && row.choice >= 0)
+            .map((row) => [row.idx, row.choice]),
+        ) as Record<number, number>;
         const next = { ...(current.roundAnswers ?? {}) };
+        const nextChoice = { ...storedChoice };
+        const prior = roundAnswerSummary(round, current.roundAnswers ?? {}, storedChoice);
         for (const item of answers) {
-          const question = current.round[item.n - 1];
+          const question = round[item.n - 1];
           if (question === undefined) {
-            return { ask: current, complete: false, summary: roundAnswerSummary(current.round, current.roundAnswers ?? {}), error: `No question ${item.n} in this round.` };
+            return { ask: current, complete: false, summary: prior, error: `No question ${item.n} in this round.` };
           }
           const matched = matchRoundChoice(question.options, item.choice);
           if (matched === null) {
-            return { ask: current, complete: false, summary: roundAnswerSummary(current.round, current.roundAnswers ?? {}), error: `Question ${item.n} has no option ${item.choice}.` };
+            return { ask: current, complete: false, summary: prior, error: `Question ${item.n} has no option ${item.choice}.` };
           }
           next[item.n] = matched.label;
+          nextChoice[item.n] = matched.index;
         }
         for (const item of answers) {
-          db.prepare("INSERT INTO owner_ask_round_answer VALUES (?,?,?) ON CONFLICT(id, idx) DO UPDATE SET label=excluded.label").run(id, item.n, next[item.n]);
+          db.prepare("INSERT INTO owner_ask_round_answer (id, idx, label, choice) VALUES (?,?,?,?) ON CONFLICT(id, idx) DO UPDATE SET label=excluded.label, choice=excluded.choice").run(id, item.n, next[item.n], nextChoice[item.n]);
         }
-        const summary = roundAnswerSummary(current.round, next);
-        const complete = current.round.every((_, index) => next[index + 1] !== undefined);
+        const summary = roundAnswerSummary(round, next, nextChoice);
+        const complete = round.every((_, index) => next[index + 1] !== undefined);
         if (complete) {
           db.prepare("UPDATE owner_ask SET state='answered', resolution=?, resolved_at=? WHERE id=?").run(summary, at, id);
           db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
@@ -738,13 +751,14 @@ export function matchRoundChoice(options: readonly AskOption[], choice: string):
   return index < 0 ? null : { index, label: options[index]!.label };
 }
 
-export function roundAnswerSummary(round: readonly RoundQuestion[], answers: Record<number, string>): string {
+export function roundAnswerSummary(round: readonly RoundQuestion[], answers: Record<number, string>, indexes: Record<number, number> = {}): string {
   return round.flatMap((question, index) => {
-    const label = answers[index + 1];
+    const n = index + 1;
+    const label = answers[n];
     if (label === undefined) return [];
-    const optionIndex = question.options.findIndex((option) => option.label === label);
+    const optionIndex = indexes[n] ?? question.options.findIndex((option) => option.label === label);
     const letter = optionIndex >= 0 ? String.fromCharCode(65 + optionIndex) : "?";
-    return [`${index + 1}${letter}`];
+    return [`${n}${letter}`];
   }).join(" ");
 }
 
