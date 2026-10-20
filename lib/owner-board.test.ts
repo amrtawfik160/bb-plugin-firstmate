@@ -390,3 +390,13 @@ test("crews working per project count the distinct running crews, not the task r
   assert.deepEqual(workingByProject(tasks, []), [], "a working task with no running crew counts none");
   assert.deepEqual(workingByProject(tasks, ["e", "z"]), [], "a crew of a closed task, or of no task, is not placed in a project");
 });
+
+test("a finished task whose worktree was kept for unsaved work says so", () => {
+  const facts = input({ tasks: [
+    task("T20", { title: "Banner", state: "live", worktreeKept: "kept: unsaved work", updatedAt: NOW - HOUR }),
+    task("T21", { title: "Audit", state: "dropped", dropReason: "Owner said stop", worktreeKept: "kept: unsaved work", updatedAt: NOW - HOUR }),
+  ] });
+  const board = formatBoard(facts);
+  assert.match(board, /- T20 Banner · live · kept: unsaved work/);
+  assert.match(board, /- T21 Audit · dropped: Owner said stop · kept: unsaved work/);
+});

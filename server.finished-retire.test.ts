@@ -547,3 +547,23 @@ test('checker167: forced cleanup failure keeps the crew so native cleanup can be
   assert.deepEqual(await crewIds(host),[]);
  }finally{await host.harness.lifecycle.dispose();}
 });
+
+// Part D: a Live or dropped task's crew thread is archived and BB then removes its worktree. The
+// finished-crew sweep must not report that removed worktree as unsaved work.
+test("a finished crew whose thread was archived and whose worktree BB removed is retired, not reported as unsaved", async () => {
+  const done = `done [at=${old}]: report ready\n`;
+  const { host } = await captainHost({ gone1: done });
+  try {
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId, projectId: "proj_1", status: "idle", environmentId: `env_${threadId}`, ...(threadId === "thr_gone" ? { archivedAt: Date.now() } : {}),
+    }));
+    host.harness.sdk.stub("environments.get", async ({ environmentId }: { environmentId: string }) => {
+      if (environmentId === "env_thr_gone") throw new Error("HTTP 404: Environment not found");
+      return { id: environmentId, hostId: "host_1", status: "ready", isWorktree: true, path: `/wt/${environmentId.slice(4)}` };
+    });
+    await host.bb.storage.kv.set("crews", [crewRow("gone1", "thr_gone")]);
+    const dry = await host.harness.behavior.runCli(["retire-finished", "--captain", "thr_cap"], ctx);
+    assert.match(dry.stdout, /would-retire\s+gone1/);
+    assert.doesNotMatch(dry.stdout, /worktree unreadable/);
+  } finally { await host.harness.lifecycle.dispose(); }
+});

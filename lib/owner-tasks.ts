@@ -284,8 +284,8 @@ export type OwnerTasks = {
   removeCrew(id: string, captain: string, input: Correction & { crewId: string }, at: number): OwnerTask;
   /** Correct a dropped task's reason; the owner's message ref stays. Moves no state. */
   amendDropReason(id: string, captain: string, input: Correction & { text: string }, at: number): OwnerTask;
-  /** Record that Live/dropped cleanup kept the worktree because it still has unsaved work. Moves no state. */
-  keepWorktree(id: string, captain: string, note: "kept: unsaved work"): OwnerTask;
+  /** Record that Live/dropped cleanup kept the worktree because it still has unsaved work; null clears it. Moves no state. */
+  keepWorktree(id: string, captain: string, note: "kept: unsaved work" | null): OwnerTask;
   /** A crew finished. When no other crew of its task still runs, settle the task. */
   finishCrew(captain: string, crewId: string, finish: CrewFinish, running: (crewId: string) => boolean,
     recordsFor: (task: OwnerTask) => readonly DeliveryRecord[], at: number): OwnerTask | undefined;
@@ -460,7 +460,11 @@ export function createOwnerTasks(db: Database, heldOpen: HeldOpen = () => null, 
     keepWorktree(id, captain, note) {
       return db.transaction(() => {
         const task = owned(id, captain);
-        if (task.worktreeKept === note) return task;
+        if ((task.worktreeKept ?? null) === note) return task;
+        if (note === null) {
+          const { worktreeKept: _cleared, ...rest } = task;
+          return save(rest);
+        }
         return save({ ...task, worktreeKept: note });
       })();
     },

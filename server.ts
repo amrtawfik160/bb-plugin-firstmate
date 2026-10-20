@@ -5729,7 +5729,7 @@ export default async function plugin(bb: BbPluginApi) {
         try {
           await sightDeploy({ project: task.project ?? "", task: task.id, source: "live-pass", detail: evidence });
           ownerTasks.move(task.id, captain, { to: "live", reason: evidence, checked: check }, now);
-          void cleanupCaptainWorktrees(captain).catch((error) => bb.log.warn(`task worktree cleanup ${task.id}: ${String(error)}`));
+          void cleanupCaptainWorktrees(captain, task.id).catch((error) => bb.log.warn(`task worktree cleanup ${task.id}: ${String(error)}`));
           return true;
         }
         catch (error) { bb.log.info(`live check: ${task.id} stays merged: ${error instanceof Error ? error.message : String(error)}`); return false; }
@@ -11772,24 +11772,31 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // Retiring a crew deletes its worktree (lib/finished-crew-retire.ts UNSAVED_WORK_SCRIPT). null: nothing unsaved.
-  async function unsavedWork(crew: Crew): Promise<{ path: string; findings: string[] } | null> {
+  // An archived thread whose environment is gone has nothing left to check: BB already removed the worktree.
+  async function unsavedWork(crew: Crew, signal?: AbortSignal): Promise<{ path: string; findings: string[] } | null> {
     let path = "";
     let envHost = "";
+    let archived = false;
     try {
-      const envId = await threadEnv(crew.threadId);
+      const thread = asRecord(await raceAbort(bb.sdk.threads.get({ threadId: crew.threadId }), signal, STUCK_HOST_CALL_MS));
+      archived = thread["archivedAt"] != null;
+      const envId = typeof thread["environmentId"] === "string" ? thread["environmentId"] : "";
       if (envId) {
-        const env = asRecord(await bb.sdk.environments.get({ environmentId: envId }));
+        const env = asRecord(await raceAbort(bb.sdk.environments.get({ environmentId: envId }), signal, STUCK_HOST_CALL_MS));
         if (typeof env["path"] === "string") path = env["path"];
         if (typeof env["hostId"] === "string") envHost = env["hostId"];
       }
-    } catch { /* unreadable: kept below */ }
-    if (path === "") return { path: "its worktree", findings: ["worktree unreadable"] };
+    } catch (error) {
+      if (isAbortError(error) || signal?.aborted) throw error;
+    }
+    if (path === "") return archived ? null : { path: "its worktree", findings: ["worktree unreadable"] };
     try {
-      const hostId = envHost !== "" ? envHost : await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined);
-      const result = await runOnHost(hostId, `bash -c ${shQuote(UNSAVED_WORK_SCRIPT)} check ${shQuote(path)} ${shQuote(crew.id)}`, 30_000);
+      const hostId = envHost !== "" ? envHost : await resolveHostForProject(crew.projectId, crew.parentThreadId ?? undefined, signal);
+      const result = await runOnHost(hostId, `bash -c ${shQuote(UNSAVED_WORK_SCRIPT)} check ${shQuote(path)} ${shQuote(crew.id)}`, 30_000, signal);
       const findings = result.exitCode === 0 ? unsavedWorkFindings(result.output) : [`worktree check failed (exit ${result.exitCode})`];
       return findings.length === 0 ? null : { path, findings };
     } catch (error) {
+      if (isAbortError(error) || signal?.aborted) throw error;
       return { path, findings: [`worktree check failed (${error instanceof Error ? error.message : String(error)})`] };
     }
   }
@@ -11885,14 +11892,30 @@ export default async function plugin(bb: BbPluginApi) {
     return rows;
   }
 
-  async function cleanupCaptainWorktrees(captain: string, parent = launchAbort.signal): Promise<void> {
+  // Archive the crew threads of a normal task that is Live or dropped, so BB removes their worktrees
+  // (lib/task-worktree-cleanup.ts). One pass per captain at a time: the schedule and the moment a task
+  // becomes Live or dropped share it, so a kept worktree is reported once.
+  const worktreeCleanupRuns = new Map<string, Promise<void>>();
+  function cleanupCaptainWorktrees(captain: string, only?: string): Promise<void> {
+    const run = (worktreeCleanupRuns.get(captain) ?? Promise.resolve()).catch(() => {}).then(() => worktreeCleanupPass(captain, only));
+    worktreeCleanupRuns.set(captain, run);
+    void run.finally(() => { if (worktreeCleanupRuns.get(captain) === run) worktreeCleanupRuns.delete(captain); }).catch(() => {});
+    return run;
+  }
+
+  async function worktreeCleanupPass(captain: string, only?: string, parent = launchAbort.signal): Promise<void> {
     if (parent.aborted) return;
     const budget = new AbortController();
     const timer = setTimeout(() => budget.abort(abortError()), CLEANUP_PASS_BUDGET_MS);
     const signal = AbortSignal.any([parent, budget.signal]);
+    const busy = (row: Record<string, unknown>) => {
+      const activity = asRecord(row["activity"]);
+      return ["activeBackgroundAgentCount", "activeBackgroundCommandCount", "activeWorkflowCount"].some((key) => Number(activity[key] ?? 0) > 0);
+    };
+    const archivedAt = (row: Record<string, unknown>) => typeof row["archivedAt"] === "number" ? row["archivedAt"] : row["archivedAt"] == null ? null : Number(row["archivedAt"]);
     try {
       const cursorKey = `task-worktree-cleanup-cursor:${captain}`;
-      const stored = await raceAbort(bb.storage.kv.get<number>(cursorKey), signal, STUCK_HOST_CALL_MS);
+      const stored = only === undefined ? await raceAbort(bb.storage.kv.get<number>(cursorKey), signal, STUCK_HOST_CALL_MS) : 0;
       const cursor = typeof stored === "number" && Number.isFinite(stored) ? stored : 0;
       const crews = (await raceAbort(readCrews(), signal, STUCK_HOST_CALL_MS)).filter((crew) => crew.parentThreadId === captain);
       const workstreamTaskIds = new Set(workstreams.listAll().flatMap((row) => row.taskIds));
@@ -11906,13 +11929,15 @@ export default async function plugin(bb: BbPluginApi) {
         })),
         maxTasks: CLEANUP_MAX_TASKS,
         cursor,
+        ...(only !== undefined ? { only } : {}),
         thread: async (id) => {
           const row = asRecord(await raceAbort(bb.sdk.threads.get({ threadId: id }), signal, STUCK_HOST_CALL_MS));
           return {
             id,
             status: typeof row["status"] === "string" ? row["status"] : "unknown",
+            busy: busy(row),
             environmentId: typeof row["environmentId"] === "string" ? row["environmentId"] : null,
-            archivedAt: typeof row["archivedAt"] === "number" ? row["archivedAt"] : row["archivedAt"] == null ? null : Number(row["archivedAt"]),
+            archivedAt: archivedAt(row),
             parentThreadId: typeof row["parentThreadId"] === "string" ? row["parentThreadId"] : null,
           };
         },
@@ -11928,7 +11953,8 @@ export default async function plugin(bb: BbPluginApi) {
             return {
               id: typeof rec["id"] === "string" ? rec["id"] : "",
               status: typeof rec["status"] === "string" ? rec["status"] : "unknown",
-              archivedAt: typeof rec["archivedAt"] === "number" ? rec["archivedAt"] : rec["archivedAt"] == null ? null : Number(rec["archivedAt"]),
+              busy: busy(rec),
+              archivedAt: archivedAt(rec),
               parentThreadId: typeof rec["parentThreadId"] === "string" ? rec["parentThreadId"] : null,
             };
           }).filter((row) => row.id !== "");
@@ -11936,19 +11962,11 @@ export default async function plugin(bb: BbPluginApi) {
         unsaved: async (_path, crewId) => {
           const crew = crews.find((row) => row.id === crewId);
           if (!crew) return null;
-          try {
-            const found = await unsavedWork(crew);
-            return found === null ? [] : found.findings;
-          } catch (error) {
-            if (isAbortError(error) || signal.aborted) throw error;
-            return null;
-          }
+          const found = await unsavedWork(crew, signal);
+          return found === null ? [] : found.findings;
         },
-        archive: async (threadId) => {
-          try { await raceAbort(bb.sdk.threads.stop({ threadId }), signal, STUCK_HOST_CALL_MS); }
-          catch (error) { if (isAbortError(error) || signal.aborted) throw error; }
-          await raceAbort(bb.sdk.threads.archive({ threadId }), signal, STUCK_HOST_CALL_MS);
-        },
+        // The thread was read idle just before this. Stopping it here could end a turn that started since.
+        archive: async (threadId) => { await raceAbort(bb.sdk.threads.archive({ threadId }), signal, STUCK_HOST_CALL_MS); },
         recordKept: (taskId, note) => {
           try { ownerTasks.keepWorktree(taskId, captain, note); }
           catch (error) { bb.log.warn(`task worktree kept ${taskId}: ${error instanceof Error ? error.message : String(error)}`); }
@@ -11961,7 +11979,7 @@ export default async function plugin(bb: BbPluginApi) {
           const task = ownerTasks.get(taskId);
           if (!task) return false;
           const key = `task-worktree-kept-notified:${taskId}:${task.finishedAt ?? 0}`;
-          const text = `⚠️ task ${task.id} is ${task.state}, but ${path} has ${findings.join(", ")}. ${KEPT_UNSAVED}. Its worktree was kept. Land or save the work. :: ${truncate(task.title, 100)}`;
+          const text = `⚠️ task ${task.id} is ${task.state}, but ${path} has ${findings.join(", ")}. ${KEPT_UNSAVED}: its worktree was not removed. Land or save the work; the next cleanup pass removes it. :: ${truncate(task.title, 100)}`;
           const afk = await readAfk(captain);
           const quiet = await readQuiet(captain);
           if (afk?.on === true || quiet.on) {
@@ -11976,12 +11994,9 @@ export default async function plugin(bb: BbPluginApi) {
           }
           return false;
         },
-        isCaptain: async (threadId) => {
-          try { return await raceAbort(isCaptainThread(threadId), signal, STUCK_HOST_CALL_MS); }
-          catch (error) { if (isAbortError(error) || signal.aborted) throw error; return true; }
-        },
+        isCaptain: (threadId) => raceAbort(isCaptainThread(threadId), signal, STUCK_HOST_CALL_MS),
       });
-      await raceAbort(bb.storage.kv.set(cursorKey, nextCursor), signal, STUCK_HOST_CALL_MS);
+      if (only === undefined) await raceAbort(bb.storage.kv.set(cursorKey, nextCursor), signal, STUCK_HOST_CALL_MS);
     } catch (error) {
       if (isAbortError(error) || signal.aborted) return;
       throw error;
@@ -16345,7 +16360,7 @@ export default async function plugin(bb: BbPluginApi) {
           const current = ownerTasks.get(id);
           if (action === "set" && current?.captain === captain && isFinishedTask(current)) return toolError(`Task ${id} is ${current.state}; it reopens only when new work arrives on it (a new crew or PR). For new work the owner asks for, dispatch with taskRef=${id}.`);
           changed = ownerTasks.move(id, captain, to === "dropped" ? { to, reason: reason ?? "", ref: ref ?? "" } : to === "live" ? { to, reason: reason ?? "" } : { to, reason }, now);
-          if (to === "live" || to === "dropped") void cleanupCaptainWorktrees(captain).catch((error) => bb.log.warn(`task worktree cleanup ${changed.id}: ${String(error)}`));
+          if (to === "live" || to === "dropped") void cleanupCaptainWorktrees(captain, changed.id).catch((error) => bb.log.warn(`task worktree cleanup ${changed.id}: ${String(error)}`));
         }
         if (action === "close") await refreshApprovalForTask(changed);
         await refreshOwnerBoard();

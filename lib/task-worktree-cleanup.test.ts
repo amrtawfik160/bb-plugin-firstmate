@@ -72,10 +72,12 @@ type World = {
   keptNotes: string[];
   reports: number;
   reported: Set<string>;
+  unsavedChecks: number;
 };
 
 function world(over: Partial<World> = {}): World {
-  return { tasks: [], crews: [], threads: {}, envs: {}, occupants: {}, dirty: {}, captains: new Set(), archived: [], keptNotes: [], reports: 0, reported: new Set(), ...over };
+  const threads: Record<string, CleanupThread> = { thr_cap: { id: "thr_cap", status: "idle", archivedAt: null } };
+  return { tasks: [], crews: [], threads, envs: {}, occupants: {}, dirty: {}, captains: new Set(["thr_cap"]), archived: [], keptNotes: [], reports: 0, reported: new Set(), unsavedChecks: 0, ...over };
 }
 
 function putCrew(w: World, crewId: string, threadId: string, envId = "env_1", extra: Partial<CleanupCrew & CleanupThread> = {}) {
@@ -104,13 +106,13 @@ async function run(w: World, extra: Partial<CleanupDeps> = {}) {
       return row;
     },
     occupants: async (id) => w.occupants[id] ?? [],
-    unsaved: async (path) => (path in w.dirty ? w.dirty[path]! : []),
+    unsaved: async (path) => { w.unsavedChecks += 1; return path in w.dirty ? w.dirty[path]! : []; },
     archive: async (id) => {
       w.archived.push(id);
       const row = w.threads[id];
       if (row) row.archivedAt = 1;
     },
-    recordKept: (taskId, note) => { w.keptNotes.push(`${taskId}:${note}`); },
+    recordKept: (taskId, note) => { w.keptNotes.push(`${taskId}:${note ?? "cleared"}`); },
     alreadyReported: async (taskId) => w.reported.has(taskId),
     reportKept: async (taskId) => { w.reports += 1; w.reported.add(taskId); return true; },
     isCaptain: async (id) => w.captains.has(id),
@@ -242,4 +244,89 @@ test("an abort mid-pass keeps later threads and a bound pass rotates", async () 
   const first = await run(bound, { maxTasks: 1, cursor: 0 });
   assert.deepEqual(bound.archived, ["thr_a"]);
   assert.equal(first.nextCursor, 1);
+});
+
+test("a crew is kept while its captain is in a turn, and archived once the captain is idle", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "dropped", dropReason: "stop", dropRef: "tg:1:1" })];
+  putCrew(w, "c1", "thr_c1");
+  w.threads["thr_cap"]!.status = "active";
+  assert.equal((await run(w)).rows[0]?.detail, "running-parent");
+  assert.deepEqual(w.archived, []);
+  w.threads["thr_cap"] = { id: "thr_cap", status: "idle", busy: true, archivedAt: null };
+  await run(w);
+  assert.deepEqual(w.archived, ["thr_c1"], "a captain's background watcher is not a turn");
+});
+
+test("a background command in the worktree keeps it", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  w.occupants["env_1"] = [{ id: "thr_c1", status: "idle", busy: true }];
+  assert.equal((await run(w)).rows[0]?.detail, "running");
+  assert.deepEqual(w.archived, []);
+});
+
+test("the worktree check runs only when a thread could be archived", async () => {
+  const shared = world();
+  shared.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(shared, "c1", "thr_c1");
+  shared.occupants["env_1"]!.push({ id: "thr_stranger", status: "idle" });
+  await run(shared);
+  assert.equal(shared.unsavedChecks, 0);
+
+  const used = world();
+  used.tasks = [task({ id: "T1", state: "live" }), task({ id: "T2", state: "working" })];
+  putCrew(used, "c1", "thr_c1");
+  await run(used);
+  assert.equal(used.unsavedChecks, 0, "c1 is still used by the open task T2");
+  assert.deepEqual(used.archived, []);
+});
+
+test("a turn that starts during the worktree check keeps the thread", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  const out = await run(w, {
+    unsaved: async () => { w.threads["thr_c1"]!.status = "active"; return []; },
+  });
+  assert.deepEqual(w.archived, []);
+  assert.equal(out.rows[0]?.detail, "running");
+});
+
+test("a worktree check that fails keeps the worktree as unsaved and the pass goes on", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live", crewIds: ["c1"] }), task({ id: "T2", state: "live", crewIds: ["c2"] })];
+  putCrew(w, "c1", "thr_1", "env_1");
+  putCrew(w, "c2", "thr_2", "env_2");
+  await run(w, {
+    unsaved: async (path) => { if (path === "/wt/env_1") throw new Error("host down"); return []; },
+  });
+  assert.deepEqual(w.archived, ["thr_2"]);
+  assert.deepEqual(w.keptNotes, [`T1:${KEPT_UNSAVED}`]);
+});
+
+test("the note is cleared once the saved worktree is archived", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live", worktreeKept: KEPT_UNSAVED })];
+  putCrew(w, "c1", "thr_c1");
+  await run(w);
+  assert.deepEqual(w.archived, ["thr_c1"]);
+  assert.deepEqual(w.keptNotes, ["T1:cleared"]);
+});
+
+test("the moment a task finishes, only that task is cleaned; a task whose crews are retired takes no place", async () => {
+  const w = world();
+  w.tasks = [
+    task({ id: "T1", state: "live", crewIds: ["gone"] }),
+    task({ id: "T2", state: "live", crewIds: ["a"] }),
+    task({ id: "T3", state: "dropped", crewIds: ["b"], dropReason: "stop", dropRef: "tg:1:1" }),
+  ];
+  putCrew(w, "a", "thr_a", "env_a");
+  putCrew(w, "b", "thr_b", "env_b");
+  await run(w, { only: "T3" });
+  assert.deepEqual(w.archived, ["thr_b"]);
+  const out = await run(w, { maxTasks: 1, cursor: 0 });
+  assert.deepEqual(w.archived, ["thr_b", "thr_a"], "T1 has no crew left, so T2 is first");
+  assert.equal(out.nextCursor, 1);
 });

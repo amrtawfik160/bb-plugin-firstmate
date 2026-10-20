@@ -15,6 +15,11 @@ export function isRunningStatus(status: string): boolean {
   return RUNNING.has(status);
 }
 
+/** A turn, or a background agent, command or workflow the thread started, is still going. */
+export function isRunning(row: { status: string; busy?: boolean }): boolean {
+  return isRunningStatus(row.status) || row.busy === true;
+}
+
 export type CleanupTrigger = "live" | "dropped";
 
 export function taskCleanupTrigger(
@@ -30,6 +35,8 @@ export function taskCleanupTrigger(
 export type Occupant = {
   id: string;
   status: string;
+  /** Background agents, commands or workflows still run, even when the turn is idle. */
+  busy?: boolean;
   archivedAt?: number | null;
   parentThreadId?: string | null;
 };
@@ -51,7 +58,7 @@ export function environmentKeepReason(env: EnvFacts, taskThreadIds: ReadonlySet<
   const live = liveOccupants(env.occupants);
   if (live.length === 0) return "already-clean";
   if (live.some((row) => !taskThreadIds.has(row.id))) return "shared";
-  if (live.some((row) => isRunningStatus(row.status))) return "running";
+  if (live.some((row) => isRunning(row))) return "running";
   if (env.unsaved === null || env.unsaved.length > 0) return "unsaved";
   return null;
 }
@@ -94,6 +101,7 @@ export type CleanupCrew = {
 export type CleanupThread = {
   id: string;
   status: string;
+  busy?: boolean;
   environmentId?: string | null;
   archivedAt?: number | null;
   parentThreadId?: string | null;
@@ -112,12 +120,15 @@ export type CleanupDeps = {
   crews: readonly CleanupCrew[];
   maxTasks?: number;
   cursor?: number;
+  /** Clean only this task now (the moment it became Live or dropped), outside the rotation. */
+  only?: string;
   thread: (id: string) => Promise<CleanupThread>;
   environment: (id: string) => Promise<CleanupEnvironment>;
   occupants: (environmentId: string) => Promise<readonly Occupant[]>;
   unsaved: (path: string, crewId: string) => Promise<readonly string[] | null>;
   archive: (threadId: string) => Promise<void>;
-  recordKept: (taskId: string, note: typeof KEPT_UNSAVED) => void;
+  /** Null clears an earlier note once the task's worktrees were archived after all. */
+  recordKept: (taskId: string, note: typeof KEPT_UNSAVED | null) => void;
   alreadyReported: (taskId: string) => Promise<boolean>;
   reportKept: (taskId: string, path: string, findings: readonly string[]) => Promise<boolean>;
   isCaptain: (threadId: string) => Promise<boolean>;
@@ -126,10 +137,12 @@ export type CleanupDeps = {
 export type CleanupRow = { taskId: string; action: "archived" | "kept"; detail: string; threadId?: string };
 
 export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows: CleanupRow[]; nextCursor: number }> {
-  const eligible = deps.tasks.filter((task) => taskCleanupTrigger(task, deps.workstreamTaskIds).trigger !== null);
+  const crewsOf = (task: OwnerTask) => deps.crews.filter((crew) => task.crewIds.includes(crew.id) && crew.worktree && !crew.workstreamId && crew.threadId);
+  // A task whose crews were all retired has nothing left to clean, so it never takes a place in the pass.
+  const eligible = deps.tasks.filter((task) => (deps.only === undefined || task.id === deps.only)
+    && taskCleanupTrigger(task, deps.workstreamTaskIds).trigger !== null && crewsOf(task).length > 0);
   const { slice, nextCursor } = rotateSlice(eligible, deps.cursor ?? 0, deps.maxTasks ?? CLEANUP_MAX_TASKS);
   const rows: CleanupRow[] = [];
-  const crewsOf = (task: OwnerTask) => deps.crews.filter((crew) => task.crewIds.includes(crew.id) && crew.worktree && !crew.workstreamId && crew.threadId);
   const openTasksHolding = (crewId: string, exceptTaskId: string) =>
     deps.tasks.filter((task) => task.id !== exceptTaskId && isOpenTask(task) && task.crewIds.includes(crewId)).map((task) => task.id);
 
@@ -138,10 +151,7 @@ export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows:
     const trigger = taskCleanupTrigger(task, deps.workstreamTaskIds);
     if (trigger.trigger === null) continue;
     const own = crewsOf(task);
-    if (own.length === 0) {
-      rows.push({ taskId: task.id, action: "kept", detail: "no managed worktree crew" });
-      continue;
-    }
+    let alreadyArchived = 0;
     const byEnv = new Map<string, CleanupCrew[]>();
     for (const crew of own) {
       if (deps.signal.aborted) break;
@@ -152,7 +162,7 @@ export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows:
         rows.push({ taskId: task.id, action: "kept", detail: `thread unreadable (${message(error)})`, threadId: crew.threadId });
         continue;
       }
-      if (thread.archivedAt != null) continue;
+      if (thread.archivedAt != null) { alreadyArchived += 1; continue; }
       const envId = thread.environmentId;
       if (!envId) {
         rows.push({ taskId: task.id, action: "kept", detail: "checkout", threadId: crew.threadId });
@@ -164,6 +174,8 @@ export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows:
     }
     if (deps.signal.aborted) break;
 
+    let keptUnsaved = false;
+    let archived = alreadyArchived;
     for (const [envId, envCrews] of byEnv) {
       if (deps.signal.aborted) break;
       let env: CleanupEnvironment;
@@ -181,12 +193,33 @@ export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows:
         continue;
       }
       const taskThreadIds = new Set(envCrews.map((crew) => crew.threadId));
-      const unsaved = env.isWorktree ? await unsavedIn(deps, env.path ?? "", envCrews) : [];
+      // Reads first; the host command for unsaved work runs only when a thread could be archived.
+      const keep = environmentKeepReason({ isWorktree: env.isWorktree, occupants, unsaved: [] }, taskThreadIds);
+      if (keep !== null) {
+        rows.push({ taskId: task.id, action: "kept", detail: keep });
+        continue;
+      }
+
+      const ready: CleanupCrew[] = [];
+      for (const crew of envCrews) {
+        if (deps.signal.aborted) break;
+        const decision = await archiveDecisionFor(deps, task, crew, openTasksHolding(crew.id, task.id));
+        if (decision === "aborted") break;
+        if (!decision.archive) {
+          rows.push({ taskId: task.id, action: "kept", detail: decision.reason, threadId: crew.threadId });
+          continue;
+        }
+        ready.push(crew);
+      }
       if (deps.signal.aborted) break;
-      const keep = environmentKeepReason({ isWorktree: env.isWorktree, occupants, unsaved }, taskThreadIds);
-      if (keep === "unsaved") {
+      if (ready.length === 0) continue;
+
+      const unsaved = await unsavedIn(deps, env.path ?? "", envCrews);
+      if (deps.signal.aborted) break;
+      if (unsaved === null || unsaved.length > 0) {
         const findings = unsaved ?? ["worktree unreadable"];
         const path = env.path || "its worktree";
+        keptUnsaved = true;
         deps.recordKept(task.id, KEPT_UNSAVED);
         try {
           if (!(await deps.alreadyReported(task.id))) await deps.reportKept(task.id, path, findings);
@@ -196,13 +229,10 @@ export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows:
         rows.push({ taskId: task.id, action: "kept", detail: `${KEPT_UNSAVED} in ${path}: ${findings.join(", ")}` });
         continue;
       }
-      if (keep !== null) {
-        rows.push({ taskId: task.id, action: "kept", detail: keep });
-        continue;
-      }
 
-      for (const crew of envCrews) {
+      for (const crew of ready) {
         if (deps.signal.aborted) break;
+        // Read again just before archiving: a turn may have started during the worktree check.
         let thread: CleanupThread;
         try { thread = await deps.thread(crew.threadId); }
         catch (error) {
@@ -210,35 +240,14 @@ export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows:
           rows.push({ taskId: task.id, action: "kept", detail: `thread unreadable (${message(error)})`, threadId: crew.threadId });
           continue;
         }
-        let parentRunning = false;
-        if (crew.parentThreadId) {
-          try {
-            const parent = await deps.thread(crew.parentThreadId);
-            parentRunning = parent.archivedAt == null && isRunningStatus(parent.status);
-          } catch (error) {
-            if (isAbort(error) || deps.signal.aborted) break;
-            parentRunning = true;
-          }
-        }
-        let captain = false;
-        try { captain = await deps.isCaptain(crew.threadId); }
-        catch (error) {
-          if (isAbort(error) || deps.signal.aborted) break;
-          captain = true;
-        }
-        const decision = threadArchiveDecision({
-          belongsToFinishedTask: task.crewIds.includes(crew.id),
-          otherOpenTaskIds: openTasksHolding(crew.id, task.id),
-          isCaptain: captain,
-          parentRunning,
-          alreadyArchived: thread.archivedAt != null,
-        });
-        if (!decision.archive) {
-          rows.push({ taskId: task.id, action: "kept", detail: decision.reason, threadId: crew.threadId });
+        if (thread.archivedAt != null) { archived += 1; continue; }
+        if (isRunning(thread)) {
+          rows.push({ taskId: task.id, action: "kept", detail: "running", threadId: crew.threadId });
           continue;
         }
         try {
           await deps.archive(crew.threadId);
+          archived += 1;
           rows.push({ taskId: task.id, action: "archived", detail: trigger.trigger, threadId: crew.threadId });
         } catch (error) {
           if (isAbort(error) || deps.signal.aborted) break;
@@ -246,8 +255,47 @@ export async function runTaskWorktreeCleanup(deps: CleanupDeps): Promise<{ rows:
         }
       }
     }
+    if (deps.signal.aborted) break;
+    if (!keptUnsaved && archived === own.length && task.worktreeKept !== undefined) deps.recordKept(task.id, null);
   }
   return { rows, nextCursor };
+}
+
+/** "aborted" when the pass is stopping; any thread read that fails keeps the thread. */
+async function archiveDecisionFor(deps: CleanupDeps, task: OwnerTask, crew: CleanupCrew, otherOpenTaskIds: readonly string[]):
+  Promise<{ archive: true } | { archive: false; reason: string } | "aborted"> {
+  let thread: CleanupThread;
+  try { thread = await deps.thread(crew.threadId); }
+  catch (error) {
+    if (isAbort(error) || deps.signal.aborted) return "aborted";
+    return { archive: false, reason: `thread unreadable (${message(error)})` };
+  }
+  if (thread.archivedAt == null && isRunning(thread)) return { archive: false, reason: "running" };
+  let parentRunning = false;
+  const parentId = thread.parentThreadId ?? crew.parentThreadId;
+  if (parentId) {
+    try {
+      const parent = await deps.thread(parentId);
+      // Only a turn counts here: a captain may keep a background watcher running for hours.
+      parentRunning = parent.archivedAt == null && isRunningStatus(parent.status);
+    } catch (error) {
+      if (isAbort(error) || deps.signal.aborted) return "aborted";
+      parentRunning = true;
+    }
+  }
+  let captain = false;
+  try { captain = await deps.isCaptain(crew.threadId); }
+  catch (error) {
+    if (isAbort(error) || deps.signal.aborted) return "aborted";
+    captain = true;
+  }
+  return threadArchiveDecision({
+    belongsToFinishedTask: task.crewIds.includes(crew.id),
+    otherOpenTaskIds,
+    isCaptain: captain,
+    parentRunning,
+    alreadyArchived: thread.archivedAt != null,
+  });
 }
 
 async function unsavedIn(deps: CleanupDeps, path: string, crews: readonly CleanupCrew[]): Promise<readonly string[] | null> {
@@ -255,7 +303,12 @@ async function unsavedIn(deps: CleanupDeps, path: string, crews: readonly Cleanu
   const findings: string[] = [];
   for (const crew of crews) {
     if (deps.signal.aborted) return null;
-    const got = await deps.unsaved(path, crew.id);
+    let got: readonly string[] | null;
+    try { got = await deps.unsaved(path, crew.id); }
+    catch (error) {
+      if (isAbort(error) || deps.signal.aborted) return null;
+      got = null;
+    }
     if (got === null) return null;
     for (const line of got) if (!findings.includes(line)) findings.push(line);
   }

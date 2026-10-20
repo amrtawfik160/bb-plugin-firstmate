@@ -160,3 +160,29 @@ test("a checkout environment is never archived", async () => {
     assert.deepEqual([...archived], []);
   } finally { await host.harness.lifecycle.dispose(); }
 });
+
+test("dropping a task through firstmate_task archives its crew at once, without waiting for the schedule", async () => {
+  const { host, archived } = await captainHost({ envOf: { thr_c1: "env_c1" } });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1")]);
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const opened = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Banner", sourceRefs: ["tg:1:1"], crewId: "c1", at: Date.now() });
+    const tool = host.harness.inspection.registrations.agentTools.find((t) => t.name === "firstmate_task")!;
+    await tool.execute({ action: "close", id: opened.id, state: "dropped", reason: "owner said stop", ref: "tg:1:9" }, ctx as never);
+    for (let i = 0; i < 50 && archived.size === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual([...archived], ["thr_c1"]);
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("a running crew of a dropped task is kept until it stops", async () => {
+  const { host, archived } = await captainHost({ envOf: { thr_c1: "env_c1" }, statusOf: { thr_c1: "active" } });
+  try {
+    await host.bb.storage.kv.set("crews", [crewRow("c1", "thr_c1")]);
+    const tasks = createOwnerTasks(host.bb.storage.database());
+    const opened = tasks.open({ captain: "thr_cap", project: "Cyndra", title: "Banner", sourceRefs: ["tg:1:1"], crewId: "c1", at: Date.now() });
+    tasks.move(opened.id, "thr_cap", { to: "dropped", reason: "owner said stop", ref: "tg:1:9" }, Date.now());
+    await host.harness.behavior.runSchedule("task-worktree-cleanup");
+    assert.deepEqual([...archived], []);
+    assert.equal(host.harness.sdk.callsTo("threads.stop").length, 0, "cleanup never stops a crew");
+  } finally { await host.harness.lifecycle.dispose(); }
+});

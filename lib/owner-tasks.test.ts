@@ -228,3 +228,14 @@ test("unsaved-work cleanup records kept: unsaved work on the task without moving
   assert.equal(kept.finishedAt, 10);
   assert.equal(tasks.keepWorktree("T1", "c", "kept: unsaved work").updatedAt, 10);
 });
+
+test("the kept-worktree note clears once the worktree is removed", () => {
+  const tasks = createOwnerTasks(memoryDb());
+  tasks.open({ captain: "c", project: "Cyndra", title: "Banner", sourceRefs: ["tg:1:1"], crewId: "c1", at: 0 });
+  tasks.move("T1", "c", { to: "dropped", reason: "owner said stop", ref: "tg:1:2" }, 10);
+  tasks.keepWorktree("T1", "c", "kept: unsaved work");
+  const cleared = tasks.keepWorktree("T1", "c", null);
+  assert.equal(cleared.worktreeKept, undefined);
+  assert.equal(tasks.get("T1")!.worktreeKept, undefined);
+  assert.equal(cleared.state, "dropped");
+});
