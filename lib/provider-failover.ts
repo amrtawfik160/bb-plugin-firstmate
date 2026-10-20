@@ -77,7 +77,8 @@ export function planLimitError(detail: string): boolean {
 
 export const PROVIDER_UNAVAILABLE_MS = 60 * 60_000;
 export const PROVIDER_UNAVAILABLE_KEY = "provider-unavailable";
-export type UnavailableProviders = Record<string, { until: number; reason: string }>;
+/** outOfBalance: the provider answered 402, so no model on it can serve a crew, named or not. */
+export type UnavailableProviders = Record<string, { until: number; reason: string; outOfBalance?: true }>;
 
 /** The reset the error names ("try again in 25 minutes"), else 60 minutes; at most a day. */
 export function unavailableUntil(text: string, now: number): number {

@@ -8656,6 +8656,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (provider === undefined) {
       try { const project = asRecord(await bb.sdk.projects.defaultExecutionOptions({ projectId })); provider = typeof project["providerId"] === "string" ? project["providerId"] : undefined; } catch { /* no default to check */ }
     }
+    // A provider out of balance fails every crew at once, also one the owner named.
+    const hold = provider === undefined ? undefined : (await unavailableProviders().catch((): UnavailableProviders => ({})))[provider];
+    if (hold?.outOfBalance === true) throw new Error(`Refusing: ${provider} is ${hold.reason} until ${utcMinute(hold.until)}, so nothing was dispatched; dispatch on another provider with providerId.`);
     const probe = signInCommand(provider);
     if (provider === undefined || probe === null || (await settings.get()).signInCheck === false) return;
     let hostId = "";
@@ -19331,7 +19334,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function handleCrewIdle(
     crew: Crew,
-    thread: { id: string; status: string; runtime?: { displayStatus?: string } },
+    thread: { id: string; status: string; providerId?: string | null; runtime?: { displayStatus?: string } },
     lastAssistantText: string | null,
   ): Promise<void> {
     if (isSecondmateRoute(crew)) return;
@@ -19347,6 +19350,7 @@ export default async function plugin(bb: BbPluginApi) {
     // BB already reports interruptions to the parent. A completion wake here can
     // cause the manager to resume work the user just stopped.
     if (stopped) return;
+    await endOutOfBalanceHold(thread.providerId ?? crew.providerId).catch((error) => bb.log.warn(`402 hold end: ${String(error)}`));
     // A crew's DONE without a PR is its delivery; a PR, once there, decides the task instead.
     if (verdictOf(outcome) === "DONE" && (await prForCrew(crew)).url === "") await finishTask(crew, { delivered: true, outcome: outcome! });
     // With a PR, a DONE report moves the task to its next step: verify, merge, release or live.
@@ -19980,7 +19984,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (crew === undefined || isSecondmateRoute(crew)) return;
     // thread.failed already paged the lifecycle error; this fires after the thread is in error.
     // A structured rate limit keeps the capacity failover below.
-    const detail = providerExhausted(errorInfo) ? "" : await threadFailureDetail(threadId);
+    const failure = providerExhausted(errorInfo) ? null : await threadFailure(threadId);
+    const detail = failure?.detail ?? "";
+    if (failure?.httpStatus === PAYMENT_REQUIRED) await holdOutOfBalance(crew, detail).catch((error) => bb.log.warn(`crew ${crew.id} 402 hold: ${String(error)}`));
     if (planLimitError(detail)) {
       await crewAtPlanLimit(crew, detail).catch((error) => bb.log.warn(`crew ${crew.id} plan limit: ${String(error)}`));
       return;
@@ -19992,6 +19998,24 @@ export default async function plugin(bb: BbPluginApi) {
     const marks = (await bb.storage.kv.get<UnavailableProviders>(PROVIDER_UNAVAILABLE_KEY)) ?? {};
     const now = Date.now();
     return Object.fromEntries(Object.entries(marks).filter(([, mark]) => mark.until > now));
+  }
+
+  // 20 Oct: Grok answered 402 "usage balance exhausted" to 10 crew threads from 01:19 to 03:49 UTC, and
+  // nothing stopped the next dispatch on it. The text names no reset, so the hold lasts the default hour.
+  async function holdOutOfBalance(crew: Crew, detail: string): Promise<void> {
+    const provider = (await bb.sdk.threads.get({ threadId: crew.threadId })).providerId ?? crew.providerId;
+    if (!provider) return;
+    const until = unavailableUntil(detail, Date.now());
+    await bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, { ...(await unavailableProviders()), [provider]: { until, reason: "out of balance (HTTP 402 Payment Required)", outOfBalance: true } });
+    bb.log.warn(`provider ${provider} answered 402 (crew ${crew.id}); dispatches on it are refused until ${utcMinute(until)}`);
+  }
+  // A crew turn the provider served shows its balance is back.
+  async function endOutOfBalanceHold(provider: string | null | undefined): Promise<void> {
+    const marks = await unavailableProviders();
+    if (!provider || marks[provider]?.outOfBalance !== true) return;
+    const { [provider]: _ended, ...rest } = marks;
+    await bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, rest);
+    bb.log.info(`provider ${provider} served a crew turn; its 402 hold ended`);
   }
 
   // A dispatch with no provider named does not start on a provider known to be at its plan limit.
