@@ -101,7 +101,7 @@ import { coalesceBatches, isBotOrAckText, parseConnectorHeader, parseInboundTele
 import { telegramFileRefusals } from "./lib/telegram-files.ts";
 import { connectorReplied, correlationOf, isTelegramRpcMissing, oldestUnanswered, sendTelegramReply, TELEGRAM_BRIDGE_PLUGIN_ID, TELEGRAM_REPLY_METHOD, telegramReplyFallbackBody, telegramReplyOutputSchema } from "./lib/telegram-reply.ts";
 import { ATTEMPT_TOKEN_ENVIRON_PY, attemptTokenFromAdmissionOutput, createLaunches, launchKey, launchTaskKey, discoverLaunch, discoverLaunchComplete, type LaunchRecord } from "./lib/launch.ts";
-import { captainWatchNeed, WATCH_NEED_LOG, type WatchNeedReason } from "./lib/captain-watch-need.ts";
+import { captainWatchNeed, NATIVE_SOURCE_REPROBE_MS, NATIVE_WATCH_SOURCES, nativeWatchSourceScript, parseNativeWatchSource, WATCH_NEED_LOG, type NativeWatchSource, type WatchNeedReason } from "./lib/captain-watch-need.ts";
 import { adoptionRead, assertAdoptableReservation, inspectAdoptionIdentity } from "./lib/launch-adoption.ts";
 import { optionHelp } from "./lib/cli-help.ts";
 import { AUDITED_BUNDLED_SNAPSHOTS, AUDITED_POLICY_COMMITS, nativeSkillPath, nativePolicyReadPython } from "./lib/native-policy.ts";
@@ -2186,6 +2186,9 @@ export default async function plugin(bb: BbPluginApi) {
   type HomeScope = { captain?: string; home?: string; host?: string };
   const homeScope = new AsyncLocalStorage<HomeScope>();
   const captainHomes = new Map<string, string>();
+  // Last host probe of each captain home's native wake sources, keyed by home. Any event that
+  // can create a source forgets the entry, so the next supervision pass probes again.
+  const nativeWatchProbes = new Map<string, { at: number; source: NativeWatchSource | "none" }>();
   for (const key of await bb.storage.kv.list("native-home:")) {
     const home = await bb.storage.kv.get<string>(key);
     if (typeof home === "string") captainHomes.set(key.slice("native-home:".length), home);
@@ -12885,7 +12888,17 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  async function runFmScript(input: {
+  // A native script can create a wake source fm-watch reports (a merge outcome, a registered
+  // check), so the home's native wake sources are probed again on the next supervision pass.
+  async function runFmScript(input: Parameters<typeof runNativeFmScript>[0]): ReturnType<typeof runNativeFmScript> {
+    try {
+      return await runNativeFmScript(input);
+    } finally {
+      if (!input.script.includes("bearings-snapshot")) nativeWatchProbes.delete(input.fmHome);
+    }
+  }
+
+  async function runNativeFmScript(input: {
     script: string;
     approvedHead?: string;
     args: string[];
@@ -20031,20 +20044,22 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  async function captainWakeQueueLive(hostId: string, fmHome: string, captain: string, signal?: AbortSignal): Promise<boolean | null> {
-    const stateDir = wakeStateDir(fmHome, captain);
-    const queue = `${stateDir}/.wake-queue`;
-    const receipt = `${stateDir}/.bb-wake-receipt.json`;
-    const script = `if [ -s ${shQuote(queue)} ] || [ -s ${shQuote(receipt)} ]; then echo FM_QUEUE=yes; else echo FM_QUEUE=no; fi`;
+  // A cached probe is reused for NATIVE_SOURCE_REPROBE_MS. That also bounds how long a stopped
+  // watcher can miss a source that no plugin event announced.
+  async function probeNativeWatchSource(hostId: string, fmHome: string, captain: string, signal?: AbortSignal): Promise<NativeWatchSource | "none"> {
+    const cached = nativeWatchProbes.get(fmHome);
+    if (cached && Date.now() - cached.at < NATIVE_SOURCE_REPROBE_MS) return cached.source;
+    const script = nativeWatchSourceScript({ binDirAssign: fmBinDirAssign(fmHome), fmHome, stateDir: wakeStateDir(fmHome, captain) });
+    let source: NativeWatchSource | "none";
     try {
-      const res = await runOnHost(hostId, script, 15_000, signal);
-      if (res.output.includes("FM_QUEUE=yes")) return true;
-      if (res.output.includes("FM_QUEUE=no")) return false;
-      return null;
+      source = parseNativeWatchSource((await runOnHost(hostId, script, 15_000, signal)).output) ?? "unreadable";
     } catch (error) {
       if (isAbortError(error)) throw error;
-      return null;
+      source = "unreadable";
     }
+    if (source === "unreadable") nativeWatchProbes.delete(fmHome);
+    else nativeWatchProbes.set(fmHome, { at: Date.now(), source });
+    return source;
   }
 
   async function resolveWatchNeed(
@@ -20052,30 +20067,37 @@ export default async function plugin(bb: BbPluginApi) {
     hostId: string,
     fmHome: string,
     captainStatus: string,
-    alreadyStopped: boolean,
     signal?: AbortSignal,
-  ): Promise<WatchNeedReason> {
-    let need = await captainHomeWatchNeed(captain, captainStatus, signal);
-    if (need !== "nothing-live" && need !== "queued-wake") return need;
-    if (need === "nothing-live" && alreadyStopped) return need;
-    const live = await captainWakeQueueLive(hostId, fmHome, captain, signal);
-    if (live === true) {
+  ): Promise<{ need: WatchNeedReason; source?: NativeWatchSource }> {
+    const need = await captainHomeWatchNeed(captain, captainStatus, signal);
+    if (need !== "nothing-live" && need !== "queued-wake") {
+      nativeWatchProbes.delete(fmHome);
+      return { need };
+    }
+    const source = await probeNativeWatchSource(hostId, fmHome, captain, signal);
+    if (source === "wake-queue") {
       await bb.storage.kv.set(`${CAPTAIN_WATCH_WAKE_PREFIX}${captain}`, true);
-      return "queued-wake";
+      return { need: "queued-wake" };
     }
-    if (live === false) {
-      await bb.storage.kv.delete(`${CAPTAIN_WATCH_WAKE_PREFIX}${captain}`);
-      return need === "queued-wake" ? "nothing-live" : need;
-    }
-    return "queued-wake";
+    // Fail closed: an unreadable home keeps its watcher and its queued-wake flag.
+    if (source === "unreadable") return { need: need === "queued-wake" ? need : "native-source", source };
+    await bb.storage.kv.delete(`${CAPTAIN_WATCH_WAKE_PREFIX}${captain}`);
+    return source === "none" ? { need: "nothing-live" } : { need: "native-source", source };
   }
 
+  function watchNeedLog(need: WatchNeedReason, source?: NativeWatchSource): string {
+    return source === undefined ? WATCH_NEED_LOG[need] : `${WATCH_NEED_LOG[need]}: ${NATIVE_WATCH_SOURCES[source]}`;
+  }
+
+  // Restarts a watcher the supervision pass stopped. A running watcher is left to the pass.
   async function ensureCaptainWatch(captain: string, reason: Exclude<WatchNeedReason, "nothing-live">, signal?: AbortSignal): Promise<void> {
     if (captain === "") return;
     try {
       const home = await bb.storage.kv.get<string>(`native-home:${captain}`);
       const host = await bb.storage.kv.get<string>(`native-home-host:${captain}`);
       if (typeof home !== "string" || home.trim() === "" || typeof host !== "string" || host === "") return;
+      nativeWatchProbes.delete(home);
+      if ((await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) !== true) return;
       if ((await bb.storage.kv.get(`${RETIRED_HOME_PREFIX}${captain}`)) === true) return;
       await inCaptainHome(captain, async () => {
         const s = await settings.get();
@@ -20129,7 +20151,8 @@ export default async function plugin(bb: BbPluginApi) {
                 return;
               }
               const alreadyStopped = (await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) === true;
-              let need = await resolveWatchNeed(captain, host, s.fmHome, thread.status, alreadyStopped, signal);
+              const resolved = await resolveWatchNeed(captain, host, s.fmHome, thread.status, signal);
+              let need = resolved.need;
               if (need === "nothing-live") {
                 if (!alreadyStopped) {
                   const latest = await raceAbort(bb.sdk.threads.get({ threadId: captain }), signal, STUCK_HOST_CALL_MS);
@@ -20157,7 +20180,7 @@ export default async function plugin(bb: BbPluginApi) {
               if (!result) return;
               if (alreadyStopped || (await bb.storage.kv.get(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`)) === true) {
                 await bb.storage.kv.delete(`${CAPTAIN_WATCH_STOPPED_PREFIX}${captain}`);
-                bb.log.info(`captain home ${captain}: watcher restarted (${WATCH_NEED_LOG[need]})`);
+                bb.log.info(`captain home ${captain}: watcher restarted (${watchNeedLog(need, resolved.source)})`);
               }
               const streak = result.keeperAlive ? 0 : result.relaunched ? (prior.success ? prior.data.consecutiveRelaunch ?? 0 : 0) + 1 : 0;
               await bb.storage.kv.set(fmWatchBeatKey(host), {

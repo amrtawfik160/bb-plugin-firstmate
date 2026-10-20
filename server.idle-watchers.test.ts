@@ -70,8 +70,8 @@ function isSuperviseCommand(cmd: string): boolean {
   return cmd.includes("FM_OWNER_BEAT") || cmd.includes("FM_KEEPER_LAUNCHED") || cmd.includes("FM_BEAT_AGE");
 }
 
-function isQueueProbe(cmd: string): boolean {
-  return cmd.includes(".wake-queue") && cmd.includes("FM_QUEUE");
+function isSourceProbe(cmd: string): boolean {
+  return cmd.includes("FM_WATCH_SOURCE=");
 }
 
 function isWakeAppend(cmd: string): boolean {
@@ -99,8 +99,8 @@ async function bindHome(host: Host) {
   await host.bb.storage.kv.set(`native-home-host:${CAPTAIN}`, "host_1");
 }
 
-function answerHost(cmd: string, queue: () => string): string {
-  if (isQueueProbe(cmd)) return queue();
+function answerHost(cmd: string, source: () => string): string {
+  if (isSourceProbe(cmd)) return `FM_WATCH_SOURCE=${source()}`;
   if (isWakeAppend(cmd)) return "FM_BB_WAKE_SEQ=1";
   if (isSuperviseCommand(cmd)) return "FM_OWNER_BEAT=ok\nFM_BEAT_AGE=5\nFM_KEEPER=alive\n---FM_LOGTAIL---\n";
   if (cmd.includes("FMWAKES")) return "FMWAKES=0";
@@ -142,7 +142,7 @@ test("the home watcher stops when nothing is live", async () => {
   try {
     await bindHome(host);
     stubCaptain(host, "idle");
-    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "FM_QUEUE=no"));
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "none"));
     const stopped = await runWatchUntil(host, () => commands.some(isStopCommand));
     assert.equal(stopped, true);
     assert.equal(commands.some(isSuperviseCommand), false);
@@ -159,7 +159,7 @@ test("the home watcher keeps running while a crew runs even if the captain threa
     await host.bb.storage.kv.set("crews", [crewRow(CREW)]);
     stubCaptain(host, "error", {}, "active");
     host.harness.sdk.stub("threads.list", async () => [makeThreadResponse({ id: CREW, status: "active", parentThreadId: CAPTAIN })]);
-    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "FM_QUEUE=no"));
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "none"));
     const supervised = await runWatchUntil(host, () => commands.some(isSuperviseCommand));
     assert.equal(supervised, true);
     assert.equal(commands.some(isStopCommand), false);
@@ -177,7 +177,7 @@ test("the home watcher starts again on dispatch with no manual step", async () =
     host.harness.sdk.stub("threads.spawn", async () => ({ id: CREW }));
     host.harness.sdk.stub("threads.defaultExecutionOptions", async () => ({ model: "grok-4", reasoningLevel: "high" }));
     host.harness.sdk.stub("projects.defaultExecutionOptions", async () => ({ providerId: "acp-grok" }));
-    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "FM_QUEUE=no"));
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "none"));
     assert.equal(await runWatchUntil(host, () => commands.some(isStopCommand)), true);
     const before = commands.filter(isSuperviseCommand).length;
     const dispatched = await tool(host, "firstmate_dispatch").execute(
@@ -198,7 +198,7 @@ test("the home watcher starts again on a queued wake", async () => {
     await bindHome(host);
     await host.bb.storage.kv.set("crews", [crewRow(CREW)]);
     stubCaptain(host, "idle");
-    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "FM_QUEUE=no"));
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "none"));
     assert.equal(await runWatchUntil(host, () => commands.some(isStopCommand)), true);
     const before = commands.filter(isSuperviseCommand).length;
     await host.harness.behavior.emitThreadEvent("thread.idle", {
@@ -219,7 +219,7 @@ test("a wake written while the watcher is stopped is kept and picked up on resta
     await bindHome(host);
     await host.bb.storage.kv.set("crews", [crewRow(CREW)]);
     stubCaptain(host, "idle");
-    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "FM_QUEUE=no"));
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "none"));
     assert.equal(await runWatchUntil(host, () => commands.some(isStopCommand)), true);
     const stop = commands.find(isStopCommand) ?? "";
     assert.doesNotMatch(stop, /ack-through|wake-drain|fm_wake_ack/);
@@ -240,7 +240,7 @@ test("a nonempty durable queue on the first idle pass keeps the watcher", async 
   try {
     await bindHome(host);
     stubCaptain(host, "idle");
-    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "FM_QUEUE=yes"));
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "wake-queue"));
     const supervised = await runWatchUntil(host, () => commands.some(isSuperviseCommand) || commands.some(isStopCommand));
     assert.equal(supervised, true);
     assert.equal(commands.some(isStopCommand), false);
@@ -269,10 +269,89 @@ test("an in-flight launch record keeps the watcher while the captain is idle", a
       threadId: null,
       updatedAt: Date.now(),
     });
-    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "FM_QUEUE=no"));
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "none"));
     const supervised = await runWatchUntil(host, () => commands.some(isSuperviseCommand) || commands.some(isStopCommand));
     assert.equal(supervised, true);
     assert.equal(commands.some(isStopCommand), false);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a registered native check keeps the watcher while every crew is idle", async () => {
+  const host = await load();
+  try {
+    await bindHome(host);
+    stubCaptain(host, "error");
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "check"));
+    const supervised = await runWatchUntil(host, () => commands.some(isSuperviseCommand) || commands.some(isStopCommand));
+    assert.equal(supervised, true);
+    assert.equal(commands.some(isStopCommand), false);
+    assert.deepEqual(logs(host, "info", /watcher stopped/), []);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("an unreadable probe keeps the watcher", async () => {
+  const host = await load();
+  try {
+    await bindHome(host);
+    stubCaptain(host, "idle");
+    const commands = hostCommands(host, (cmd) => (isSourceProbe(cmd) ? "garbled" : answerHost(cmd, () => "none")));
+    const supervised = await runWatchUntil(host, () => commands.some(isSuperviseCommand) || commands.some(isStopCommand));
+    assert.equal(supervised, true);
+    assert.equal(commands.some(isStopCommand), false);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a stopped watcher probes again after a native script run and restarts for the source it finds", async () => {
+  const host = await load({ fmHostId: "host_1" });
+  try {
+    await bindHome(host);
+    stubCaptain(host, "idle");
+    let source = "none";
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => source));
+    assert.equal(await runWatchUntil(host, () => commands.some(isStopCommand)), true);
+    const probes = () => commands.filter(isSourceProbe).length;
+    const afterStop = probes();
+    // While stopped, a pass reuses the last probe: no new host command.
+    let reads = 0;
+    host.harness.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) => {
+      if (threadId === CAPTAIN) reads++;
+      return makeThreadResponse({ id: threadId, projectId: "proj_1", status: "idle", environmentId: null });
+    });
+    let firstRead = 0;
+    await runWatchUntil(host, () => {
+      if (reads > 0 && firstRead === 0) firstRead = Date.now();
+      return firstRead > 0 && Date.now() - firstRead > 150;
+    });
+    assert.ok(reads > 0);
+    assert.equal(probes(), afterStop);
+    assert.equal(commands.filter(isSuperviseCommand).length, 0);
+    source = "check";
+    await tool(host, "firstmate_fm").execute({ script: "status" }, { threadId: CAPTAIN, projectId: "proj_1" } as never);
+    assert.equal(await runWatchUntil(host, () => commands.some(isSuperviseCommand)), true);
+    assert.ok(probes() > afterStop);
+    assert.match(logs(host, "info", /watcher restarted/).join("\n"), /thr_cap: watcher restarted \(native wake source: registered check\)/);
+  } finally {
+    await host.harness.lifecycle.dispose();
+  }
+});
+
+test("a captain turn on a running watcher leaves supervision to the pass", async () => {
+  const host = await load();
+  try {
+    await bindHome(host);
+    stubCaptain(host, "active");
+    const commands = hostCommands(host, (cmd) => answerHost(cmd, () => "none"));
+    await host.harness.behavior.emitThreadEvent("thread.active", {
+      thread: makeThreadResponse({ id: CAPTAIN, status: "active", projectId: "proj_1" }),
+    });
+    assert.equal(commands.some(isSuperviseCommand), false);
+    assert.deepEqual(logs(host, "info", /watcher restarted/), []);
   } finally {
     await host.harness.lifecycle.dispose();
   }
