@@ -4,6 +4,11 @@ import { randomInt } from "node:crypto";
 export type AskKind = "question" | "blocker" | "approval";
 export type AskState = "open" | "answered" | "defaulted" | "cancelled";
 export type AskOption = { label: string; value: string };
+export type RoundQuestion = {
+  question: string;
+  options: AskOption[];
+  recommended: number;
+};
 
 export type OwnerAsk = {
   id: string;
@@ -13,6 +18,10 @@ export type OwnerAsk = {
   impact?: string;
   options: AskOption[];
   recommended: number | null;
+  /** A grilling batch stored as one ask: 2 to 12 questions in one Telegram message. */
+  round?: RoundQuestion[];
+  /** 1-based question index to the recorded option label. */
+  roundAnswers?: Record<number, string>;
   defaultAt: number | null;
   irreversible: boolean;
   /** An option starts new work (a build, a new crew, a new ticket), so the ask waits for the owner. */
@@ -159,6 +168,7 @@ export type NewOwnerAsk = Pick<OwnerAsk, "captain" | "kind" | "text" | "options"
   task?: string;
   subject?: string;
   createdAt: number;
+  round?: RoundQuestion[];
 };
 
 type Database = {
@@ -238,6 +248,31 @@ export function formatAskCard(ask: Pick<OwnerAsk, "kind" | "text" | "impact" | "
   return [`${ASK_KIND_EMOJI[ask.kind]} ${ask.text.trim()}`, ...(ask.impact ? [ask.impact] : []), ...listed, ...deadline].join("\n");
 }
 
+export const ASK_ROUND_MAX_CHARS = 3000;
+export const ASK_ROUND_ANSWER_HINT = "Answer like 1A 2C, or 'yes' to accept all recommended.";
+
+/** One numbered Telegram message for a grilling batch: no buttons, recommended marked with ✓. */
+export function formatAskRound(ask: Pick<OwnerAsk, "text" | "round"> & { impact?: string }): string {
+  const round = ask.round ?? [];
+  const questions = round.map((item, index) => {
+    const lines = [`${index + 1}. ${item.question.trim()}`];
+    for (let i = 0; i < item.options.length; i++) {
+      const letter = String.fromCharCode(65 + i);
+      const mark = item.recommended === i ? "✓ " : "";
+      lines.push(`${mark}${letter}. ${optionText(item.options[i]!.label)}`);
+    }
+    return lines.join("\n");
+  });
+  const first = round[0]?.question.trim() ?? "";
+  const title = ask.text.trim() !== "" && ask.text.trim() !== first ? ask.text.trim() : "";
+  const head = [title, ask.impact?.trim() ?? ""].filter((part) => part !== "");
+  return [...head, ...questions, ASK_ROUND_ANSWER_HINT].join("\n\n");
+}
+
+export function isRoundAsk(ask: Pick<OwnerAsk, "round">): boolean {
+  return (ask.round?.length ?? 0) >= 2;
+}
+
 /**
  * The cards a pack answer recorded. The connector sends "Accept all recommended", "2B" or "1A 3C" with one
  * "- ask <id>: <option label>" line per card under "Answers recorded on the cards:".
@@ -264,6 +299,8 @@ export type OwnerAsks = {
   listCandidates(captain: string, now: number): OwnerAsk[];
   /** Correct or reopen an ask owned by this captain. */
   resolve(id: string, captain: string, state: AskState, resolution: string, at: number, source?: "owner"): OwnerAsk | undefined;
+  /** Record answers on a grilling round. Partial keeps it open; a full set closes it. */
+  recordRoundAnswers(id: string, captain: string, answers: ReadonlyArray<{ n: number; choice: string }>, at: number): { ask: OwnerAsk; complete: boolean; summary: string; error?: string } | undefined;
   answeredByOwner(id: string): boolean;
   /** Close only the named cards, atomically; owner closes are terminal and repeated closes are no-ops. */
   close(ids: readonly string[], captain: string, now?: number): AskClosure;
@@ -364,7 +401,10 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       previous TEXT, resolution TEXT,
       PRIMARY KEY (ask_id, answer_seq, effect));
     CREATE TABLE IF NOT EXISTS owner_ask_default_notice (
-      id TEXT PRIMARY KEY, told INTEGER NOT NULL DEFAULT 0);`);
+      id TEXT PRIMARY KEY, told INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS owner_ask_round (id TEXT PRIMARY KEY, questions TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS owner_ask_round_answer (
+      id TEXT NOT NULL, idx INTEGER NOT NULL, label TEXT NOT NULL, PRIMARY KEY (id, idx));`);
   {
     const cols = new Set((db.prepare("PRAGMA table_info(owner_ask_followup)").all() as Array<{ name: string }>).map((row) => row.name));
     if (!cols.has("attempts")) db.exec("ALTER TABLE owner_ask_followup ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0");
@@ -400,9 +440,27 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     (SELECT until FROM owner_ask_defer WHERE id=owner_ask.id) AS deferred_until,
     owner_ask_link.message_url FROM owner_ask LEFT JOIN owner_ask_link USING(id)`;
 
+  function load(row: AskRecord): OwnerAsk {
+    const ask = fromRecord(row);
+    const roundRow = db.prepare("SELECT questions FROM owner_ask_round WHERE id=?").get(ask.id) as { questions: string } | undefined;
+    if (!roundRow) return ask;
+    let round: RoundQuestion[] = [];
+    try {
+      const parsed: unknown = JSON.parse(roundRow.questions);
+      if (Array.isArray(parsed)) round = parsed as RoundQuestion[];
+    } catch { return ask; }
+    if (round.length === 0) return ask;
+    const answers = db.prepare("SELECT idx, label FROM owner_ask_round_answer WHERE id=?").all(ask.id) as Array<{ idx: number; label: string }>;
+    return {
+      ...ask,
+      round,
+      ...(answers.length > 0 ? { roundAnswers: Object.fromEntries(answers.map((item) => [item.idx, item.label])) } : {}),
+    };
+  }
+
   function get(id: string): OwnerAsk | undefined {
     const row = db.prepare(`${select} WHERE owner_ask.id=?`).get(id) as AskRecord | undefined;
-    return row ? fromRecord(row) : undefined;
+    return row ? load(row) : undefined;
   }
 
   function answeredByOwner(id: string): boolean {
@@ -410,11 +468,11 @@ export function createOwnerAsks(db: Database): OwnerAsks {
   }
 
   function listOpen(captain: string): OwnerAsk[] {
-    return (db.prepare(`${select} WHERE captain=? AND state='open' ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(fromRecord);
+    return (db.prepare(`${select} WHERE captain=? AND state='open' ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(load);
   }
 
   function create(input: NewOwnerAsk): OwnerAsk {
-    if (input.kind === "question" && input.options.length === 0) {
+    if (input.kind === "question" && input.options.length === 0 && (input.round === undefined || input.round.length === 0)) {
       throw new Error("A question card needs options. Status belongs on the task, not as an open card.");
     }
     let id = input.id ?? newAskId();
@@ -440,6 +498,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       ...(input.project ? { project: input.project } : {}),
       ...(input.task ? { task: input.task } : {}),
       ...(input.subject ? { subject: input.subject } : {}),
+      ...(input.round && input.round.length > 0 ? { round: input.round } : {}),
     };
     db.prepare("INSERT INTO owner_ask VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
       ask.id, ask.captain, ask.kind, ask.text, JSON.stringify(ask.options), ask.recommended, ask.defaultAt,
@@ -450,6 +509,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
     if (input.sourceRef) db.prepare("INSERT INTO owner_ask_source VALUES (?,?,?)").run(input.captain, input.sourceRef, ask.id);
     if (input.messageUrl) db.prepare("INSERT INTO owner_ask_link VALUES (?,?)").run(ask.id, input.messageUrl);
     if (input.project || input.task || input.subject) db.prepare("INSERT INTO owner_ask_route VALUES (?,?,?,?)").run(ask.id, input.project ?? null, input.task ?? null, input.subject ?? null);
+    if (input.round && input.round.length > 0) db.prepare("INSERT INTO owner_ask_round VALUES (?,?)").run(id, JSON.stringify(input.round));
     return ask;
   }
 
@@ -482,10 +542,10 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       })();
     },
     untoldCloses(captain) {
-      return (db.prepare(`${select} WHERE captain=? AND EXISTS(SELECT 1 FROM owner_ask_close WHERE id=owner_ask.id AND told=0) ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(fromRecord);
+      return (db.prepare(`${select} WHERE captain=? AND EXISTS(SELECT 1 FROM owner_ask_close WHERE id=owner_ask.id AND told=0) ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(load);
     },
     unreleasedCloses(captain) {
-      return (db.prepare(`${select} WHERE captain=? AND EXISTS(SELECT 1 FROM owner_ask_close WHERE id=owner_ask.id AND released=0) ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(fromRecord);
+      return (db.prepare(`${select} WHERE captain=? AND EXISTS(SELECT 1 FROM owner_ask_close WHERE id=owner_ask.id AND released=0) ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(load);
     },
     markClosesReleased(ids) {
       for (const id of ids) db.prepare("UPDATE owner_ask_close SET released=1 WHERE id=?").run(id);
@@ -515,7 +575,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       for (const id of ids) db.prepare("UPDATE owner_ask_defer SET told=1 WHERE id=?").run(id);
     },
     listCandidates(captain, now) {
-      return (db.prepare(`${select} WHERE captain=? AND (state='open' OR (state='answered' AND resolved_at>=?)) ORDER BY created_at, owner_ask.id`).all(captain, now - 86_400_000) as AskRecord[]).map(fromRecord);
+      return (db.prepare(`${select} WHERE captain=? AND (state='open' OR (state='answered' AND resolved_at>=?)) ORDER BY created_at, owner_ask.id`).all(captain, now - 86_400_000) as AskRecord[]).map(load);
     },
     answeredByOwner,
     resolve(id, captain, state, resolution, at, source) {
@@ -540,8 +600,40 @@ export function createOwnerAsks(db: Database): OwnerAsks {
         }
         // A skip ends when the card is answered or reopened: a reopened card waits on the owner again.
         db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
+        if (state === "open") db.prepare("DELETE FROM owner_ask_round_answer WHERE id=?").run(id);
         const { deferredUntil: _skip, ...rest } = current;
-        return { ...rest, state, resolution: state === "open" ? null : resolution, resolvedAt: state === "open" ? null : at };
+        return { ...rest, state, resolution: state === "open" ? null : resolution, resolvedAt: state === "open" ? null : at, ...(state === "open" ? { roundAnswers: undefined } : {}) };
+      })();
+    },
+    recordRoundAnswers(id, captain, answers, at) {
+      return db.transaction(() => {
+        const current = get(id);
+        if (!current || current.captain !== captain || current.state !== "open") return undefined;
+        if (current.round === undefined || current.round.length === 0) {
+          return { ask: current, complete: false, summary: "", error: "Ask is not a grilling round." };
+        }
+        const next = { ...(current.roundAnswers ?? {}) };
+        for (const item of answers) {
+          const question = current.round[item.n - 1];
+          if (question === undefined) {
+            return { ask: current, complete: false, summary: roundAnswerSummary(current.round, current.roundAnswers ?? {}), error: `No question ${item.n} in this round.` };
+          }
+          const matched = matchRoundChoice(question.options, item.choice);
+          if (matched === null) {
+            return { ask: current, complete: false, summary: roundAnswerSummary(current.round, current.roundAnswers ?? {}), error: `Question ${item.n} has no option ${item.choice}.` };
+          }
+          next[item.n] = matched.label;
+        }
+        for (const item of answers) {
+          db.prepare("INSERT INTO owner_ask_round_answer VALUES (?,?,?) ON CONFLICT(id, idx) DO UPDATE SET label=excluded.label").run(id, item.n, next[item.n]);
+        }
+        const summary = roundAnswerSummary(current.round, next);
+        const complete = current.round.every((_, index) => next[index + 1] !== undefined);
+        if (complete) {
+          db.prepare("UPDATE owner_ask SET state='answered', resolution=?, resolved_at=? WHERE id=?").run(summary, at, id);
+          db.prepare("DELETE FROM owner_ask_defer WHERE id=?").run(id);
+        }
+        return { ask: get(id)!, complete, summary };
       })();
     },
     takeDue(captain, now) {
@@ -556,7 +648,7 @@ export function createOwnerAsks(db: Database): OwnerAsks {
       })();
     },
     untoldDefaults(captain) {
-      return (db.prepare(`${select} WHERE captain=? AND state='defaulted' AND EXISTS(SELECT 1 FROM owner_ask_default_notice WHERE id=owner_ask.id AND told=0) ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(fromRecord);
+      return (db.prepare(`${select} WHERE captain=? AND state='defaulted' AND EXISTS(SELECT 1 FROM owner_ask_default_notice WHERE id=owner_ask.id AND told=0) ORDER BY created_at, owner_ask.id`).all(captain) as AskRecord[]).map(load);
     },
     markDefaultsTold(ids) {
       for (const id of ids) db.prepare("UPDATE owner_ask_default_notice SET told=1 WHERE id=?").run(id);
@@ -633,8 +725,31 @@ export function askLetterAnswer(ask: Pick<OwnerAsk, "options">, text: string): s
   return letter ? ask.options[letter.charCodeAt(0) - 65]?.label ?? null : null;
 }
 
+export function matchRoundChoice(options: readonly AskOption[], choice: string): { index: number; label: string } | null {
+  const raw = choice.trim();
+  if (raw === "") return null;
+  const letter = /^([a-d])\.?$/i.exec(raw)?.[1]?.toUpperCase();
+  if (letter !== undefined) {
+    const index = letter.charCodeAt(0) - 65;
+    const option = options[index];
+    return option === undefined ? null : { index, label: option.label };
+  }
+  const index = options.findIndex((option) => option.label === raw || optionText(option.label) === raw);
+  return index < 0 ? null : { index, label: options[index]!.label };
+}
+
+export function roundAnswerSummary(round: readonly RoundQuestion[], answers: Record<number, string>): string {
+  return round.flatMap((question, index) => {
+    const label = answers[index + 1];
+    if (label === undefined) return [];
+    const optionIndex = question.options.findIndex((option) => option.label === label);
+    const letter = optionIndex >= 0 ? String.fromCharCode(65 + optionIndex) : "?";
+    return [`${index + 1}${letter}`];
+  }).join(" ");
+}
+
 /** Re-sent to the captain every turn and printed at session start, so it survives a compaction. */
 // 10 Oct the captain ran gh pr merge; up to 13 Oct it ran Safi production publishes.
 // Keep this sentence equal to the CAPTAIN RULES block in overlay/bin/bb-captain-hook.sh.
 export const CAPTAIN_RULES = "Captain rules: do not deploy, publish, merge, commit or push yourself. A crew does that work. Merge with firstmate_merge crewId + pr. Before you tell the owner that something is open, check its firstmate_task or firstmate_deliveries record. Full rules: firstmate_skill name=captain reference=references/supervision.md.";
-export const OWNER_DECISION_RULE = "Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text in firstmate_reply or closing text. Decide reversible choices yourself and say in one sentence what you chose. Open cards are on the owner's board, so reports do not repeat them. Full rules: firstmate_skill name=captain reference=references/telegram.md.";
+export const OWNER_DECISION_RULE = "Send every decision, approval or blocker for the owner with firstmate_ask, one question per card, never as plain text in firstmate_reply or closing text. A grilling question batch is one firstmate_ask round: one message, no per-question cards. Decide reversible choices yourself and say in one sentence what you chose. Open cards are on the owner's board, so reports do not repeat them. Full rules: firstmate_skill name=captain reference=references/telegram.md.";
