@@ -11,6 +11,7 @@ export const HOUSE_RULES = [
   "`code-review`: run its Standards and Spec reviews yourself, one after the other, not as sub-agents.",
   "`implement-spec`: never start its sub-agents and never merge a ticket. Build your brief's tickets on your branch and follow the delivery contract.",
   "Production changes require the owner’s approval card naming the change. The captain passes that approval to the crew before merge or deploy.",
+  "Before a production merge or deploy, run `bb firstmate prod-check <project> <merge|deploy>` with the task or PR; it exits non-zero without an owner approval or pre-approval.",
   "Merge only via `bb firstmate merge <crew> --pr <n> --yes`; it refuses a PR with no verification record. Never use `gh pr merge` or GitHub's API.",
   "This host is shared. Run every type check, full test run and build as `~/.bb-firstmate/bin/fm-heavy <command>`; it waits for a host-wide slot.",
   "Do not start such commands in the background or as your own systemd service to skip the wait. Stop dev servers and browsers you started when you finish.",
