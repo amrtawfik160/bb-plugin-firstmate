@@ -66,7 +66,7 @@ async function completedWithSavedRetry() {
   const r = store.register({ url: URL, taskId: 'woo1', projectId: 'proj_1', owner: 'thr_cap', home: '/native', worker: 'thr_woo', requirement: 'merged-and-verified', title: `Change ${N}` });
   store.observe(r.id, { headSha: HEAD, state: 'open', draft: false, checks: 'passing', review: 'approved', reviewHeadSha: HEAD, mergeCommitSha: null, mergeable: 'mergeable' }, true);
   const tool = (name) => host.harness.inspection.registrations.agentTools.find((t) => t.name === name);
-  const deliveries = (input, threadId) => tool('firstmate_deliveries').execute(input, { threadId, projectId: 'proj_1' });
+  const deliveries = (input, threadId = 'thr_cap') => tool('firstmate_deliveries').execute(input, { threadId, projectId: 'proj_1' });
   const asked = JSON.stringify(await deliveries({ action: 'device-proof', id: ID, commitSha: HEAD.slice(0, 7), build: '6', link: 'https://testflight.apple.com/join/abc', check: 'Send a photo' }, 'thr_woo'));
   const askId = /card (a[0-9a-z]{6})/.exec(asked)?.[1];
   assert.ok(askId, asked);
@@ -78,11 +78,22 @@ async function completedWithSavedRetry() {
   assert.equal(store.get(ID).status, 'complete');
   assert.equal(gate.statusPostNeeded(ID, HEAD), true);
   commands.length = 0;
-  return { host, store, gate, commands, recover: () => { statusOk = true; } };
+  return { host, store, gate, commands, deliveries, recover: () => { statusOk = true; } };
 }
 
 const posts = (commands) => commands.filter((c) => c.includes(`/statuses/${HEAD}`));
 const prReads = (commands) => commands.filter((c) => c.includes('gh pr view') && c.includes(`/pull/${N}`));
+const retryRows = (c) => c.host.bb.storage.database().prepare('SELECT pr, last_error FROM production_status_retry ORDER BY pr').all();
+// More completed deliveries of the same repository, each with a saved status post.
+function addCompleted(c, from, to, error) {
+  for (let n = from; n <= to; n++) {
+    const r = c.store.register({ url: `https://github.com/${REPO}/pull/${n}`, taskId: 'woo1', projectId: 'proj_1', owner: 'thr_cap', home: '/native', worker: 'thr_woo', requirement: 'merged', title: `Change ${n}` });
+    c.store.observe(r.id, { headSha: HEAD, state: 'merged', draft: false, checks: 'passing', review: 'approved', reviewHeadSha: HEAD, mergeCommitSha: MERGE_SHA, mergeable: 'mergeable' }, true);
+    c.store.verify(r.id, 'thr_cap', MERGE_SHA, { driven: 'Opened the changed screen', seen: 'The change worked' });
+    assert.equal(c.store.get(r.id).status, 'complete');
+    c.gate.needStatusPost(r.id, HEAD, error, Date.now());
+  }
+}
 
 test('background pass retries a completed delivery\'s saved status post without reading the PR again', async () => {
   const c = await completedWithSavedRetry();
@@ -113,4 +124,71 @@ test('a background status retry that fails again keeps the saved post until one 
     assert.equal(c.gate.statusPostNeeded(ID, HEAD), false);
     assert.equal(c.store.get(ID).status, 'complete');
   } finally { await c.host.harness.lifecycle.dispose(); }
+});
+
+test('a background pass posts at most the shared burst; held-back posts stay saved with their last error', async () => {
+  const c = await completedWithSavedRetry();
+  const realNow = Date.now;
+  try {
+    let simulated = realNow() + 3_600_000;
+    Date.now = () => simulated;
+    addCompleted(c, 131, 150, 'GitHub outage');
+    const saved = new Map(retryRows(c).map((row) => [row.pr, row.last_error]));
+    assert.equal(saved.size, 21);
+    c.recover();
+    await c.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+    const first = posts(c.commands).length;
+    assert.ok(first >= 1 && first <= 10, `${first} status posts in one pass; the shared burst is 10`);
+    const left = retryRows(c);
+    assert.equal(left.length, 21 - first);
+    // A post the allowance held back is not a transport failure: its saved error is unchanged.
+    for (const row of left) assert.equal(row.last_error, saved.get(row.pr), row.pr);
+    for (let pass = 0; pass < 10 && retryRows(c).length > 0; pass++) {
+      simulated += 60_000;
+      await c.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+    }
+    assert.deepEqual(retryRows(c), []);
+    assert.equal(posts(c.commands).length, 21, 'each saved post is sent once');
+    assert.deepEqual(prReads(c.commands), []);
+  } finally { Date.now = realNow; await c.host.harness.lifecycle.dispose(); }
+});
+
+test('a long outage keeps background status posts within the rolling hourly allowance; an explicit reconcile is not charged', async () => {
+  const c = await completedWithSavedRetry();
+  const realNow = Date.now;
+  try {
+    let simulated = realNow() + 3_600_000;
+    Date.now = () => simulated;
+    addCompleted(c, 131, 142, 'GitHub outage');
+    // One pass a minute. The burst of 10 and the pace of 470 an hour would allow 472 posts in
+    // the first 60 passes, all inside one hour: the hourly allowance of 470 stops the last ones.
+    const passes = [];
+    const pass = async () => {
+      const before = posts(c.commands).length;
+      await c.host.harness.behavior.runSchedule('pr-delivery-follow-up');
+      passes.push({ at: simulated, posts: posts(c.commands).length - before });
+    };
+    for (let n = 0; n < 60; n++) {
+      if (n > 0) simulated += 60_000;
+      await pass();
+    }
+    const counts = passes.map((p) => p.posts);
+    assert.ok(counts[0] <= 10, `${counts[0]} status posts in the first pass; the shared burst is 10`);
+    assert.equal(counts.reduce((sum, n) => sum + n, 0), 470, counts.join(','));
+    // An explicit reconcile is the captain's own request: it posts though the background allowance is used up.
+    const before = posts(c.commands).length;
+    await c.deliveries({ action: 'reconcile', id: ID });
+    assert.equal(posts(c.commands).length - before, 1);
+    for (let n = 0; n < 15; n++) {
+      simulated += 60_000;
+      await pass();
+    }
+    for (const end of passes) {
+      const inHour = passes.filter((p) => p.at > end.at - 3_600_000 && p.at <= end.at).reduce((sum, p) => sum + p.posts, 0);
+      assert.ok(inHour <= 470, `${inHour} background status posts in the hour up to ${end.at}; the hourly allowance is 470`);
+    }
+    assert.ok(passes.slice(60).some((p) => p.posts > 0), 'posts resume once the first passes leave the hour');
+    assert.equal(retryRows(c).length, 13, 'every failed or held-back post stays saved');
+    assert.deepEqual(prReads(c.commands), []);
+  } finally { Date.now = realNow; await c.host.harness.lifecycle.dispose(); }
 });

@@ -9635,7 +9635,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const { pr, head } of statusRetries) {
       signal?.throwIfAborted();
       if (backgroundAllowance() <= 0) break;
-      await boundedFollowUp(() => serializeLedger(`delivery:${pr}`, () => retryOwnerApprovalStatus(pr, head)), signal)
+      await boundedFollowUp(() => serializeLedger(`delivery:${pr}`, () => retryOwnerApprovalStatus(pr, head, true)), signal)
         .catch(error => bb.log.warn(`Owner approval status retry ${pr}: ${String(error)}`));
     }
     await backgroundBudget.run("sweep", () => retireEndedRetainedRecords(cycleLists, signal)).catch((error) => { if (!signal?.aborted) bb.log.warn(`Retained native records: ${String(error)}`); });
@@ -11051,7 +11051,7 @@ export default async function plugin(bb: BbPluginApi) {
     try { return canonicalPr(trimmed).id; } catch { return undefined; }
   }
 
-  async function syncOwnerApprovalStatus(pr: string, head: string, hostId: string | null, task?: OwnerTask | null): Promise<void> {
+  async function syncOwnerApprovalStatus(pr: string, head: string, hostId: string | null, task?: OwnerTask | null, charged = false): Promise<void> {
     if (!pr || !head) return;
     const found = task ?? taskForPr(pr);
     const cards = ownerGate.cardsForPr(pr);
@@ -11074,6 +11074,13 @@ export default async function plugin(bb: BbPluginApi) {
         fail("no host");
         return;
       }
+      // A background retry spends one request of the shared GitHub allowance on the post. With
+      // none left the post waits, saved, for a later pass; that is not a failure. Explicit
+      // requests are not charged.
+      if (charged && !reserveGithub(postedHost, false, 1, true)) {
+        ownerGate.deferStatusPost(pr, head, Date.now());
+        return;
+      }
       const posted = await runStructuredOnHost(postedHost, postStatusCommand(repo, head, status), 30_000);
       if (posted.exitCode !== 0) throw new Error(posted.stderr || posted.output || `status exit ${posted.exitCode}`);
       ownerGate.clearStatusPost(pr, head);
@@ -11083,11 +11090,12 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // A completed or abandoned delivery is no longer polled; its saved status post retries here.
-  async function retryOwnerApprovalStatus(pr: string, head: string): Promise<void> {
+  // charged: a background retry, paid from the shared GitHub allowance.
+  async function retryOwnerApprovalStatus(pr: string, head: string, charged = false): Promise<void> {
     const record = deliveries.get(pr);
     const task = taskForPr(pr, record?.owner, record?.taskId);
     const hostId = await gateHost(task?.projectId ?? record?.projectId, record?.owner ?? task?.captain);
-    await syncOwnerApprovalStatus(pr, head, hostId, task);
+    await syncOwnerApprovalStatus(pr, head, hostId, task, charged);
   }
 
   async function syncOwnerApprovalForAsk(askId: string): Promise<void> {
