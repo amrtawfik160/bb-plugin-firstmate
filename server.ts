@@ -2576,7 +2576,10 @@ export default async function plugin(bb: BbPluginApi) {
           // Only an environment whose path is the workstream worktree becomes the workstream environment.
           if (env.path) workstreams.environment(crew.workstreamId,crew.parentThreadId ?? "",env.path,thread.environmentId);
         }
-        return thread.status;
+        // A turn that ended while its background agents, commands or workflows still run is still working: a
+        // conflict crew keeps the workstream worktree, and no crew is folded, until that work ends too.
+        const row = asRecord(thread);
+        return row["archivedAt"] == null && backgroundBusy(row) ? "active" : thread.status;
       } catch { return "unknown"; }
     },
     devActivity: async (w) => {
@@ -2733,7 +2736,8 @@ export default async function plugin(bb: BbPluginApi) {
         try { thread = asRecord(await bb.sdk.threads.get({ threadId })); }
         catch (error) { return { wait: `its crew thread is unreadable (${error instanceof Error ? error.message : String(error)})` }; }
         if (thread["archivedAt"] == null) {
-          if (threadRunning(thread)) return { running: threadId };
+          // Saved and folded only when idle with no background work; an erroring crew may still recover.
+          if (thread["status"] !== "idle" || threadRunning(thread)) return { running: threadId };
           const envId = typeof thread["environmentId"] === "string" ? thread["environmentId"] : null;
           const path = envId ? asRecord(await bb.sdk.environments.get({ environmentId: envId }).catch(() => ({})))["path"] : undefined;
           if (typeof path === "string" && path && path !== checkout.path) return { wait: "its crew now works in another worktree" };
@@ -2978,7 +2982,7 @@ export default async function plugin(bb: BbPluginApi) {
       // Each builder crew's checkout, read now: a live worktree of the task's repository is folded from there,
       // after its unsaved work is saved; a worktree that is gone or holds another repository is not.
       type Checkout = { path: string; envId: string | null; host: string; branch: string };
-      const checkouts = new Map<string, { checkout: Checkout | null; running: boolean }>();
+      const checkouts = new Map<string, { checkout: Checkout | null; running: boolean; pending: boolean }>();
       const checkoutOf = async (crew: Crew) => {
         if (checkouts.has(crew.id)) return checkouts.get(crew.id)!;
         let thread: Record<string, unknown> | null = null;
@@ -2991,12 +2995,15 @@ export default async function plugin(bb: BbPluginApi) {
         const host = typeof env?.["hostId"] === "string" && env["hostId"] ? env["hostId"] : hostId;
         const branch = (typeof env?.["branchName"] === "string" && env["branchName"]) || crew.branch || "";
         const own = !!path && (await originOf(path, host)).toLowerCase() === repository.toLowerCase();
-        const found = { checkout: own ? { path, envId, host, branch } : null, running: live && threadRunning(thread!) };
+        // A crew that is not idle with its background work done (working, or in an error it may recover from)
+        // folds when it is; only an actively working crew outside the repository refuses the adopt.
+        const pending = live && (thread!["status"] !== "idle" || threadRunning(thread!));
+        const found = { checkout: own ? { path, envId, host, branch } : null, running: live && threadRunning(thread!), pending };
         checkouts.set(crew.id, found);
         return found;
       };
-      const fromCheckout = (crew: Crew, co: Checkout, running: boolean) => ({
-        ...common, crewId: crew.id, threadId: crew.threadId, from: "worktree" as const, branch: co.branch, path: co.path, environmentId: co.envId, hostId: co.host, running,
+      const fromCheckout = (crew: Crew, co: Checkout, pending: boolean) => ({
+        ...common, crewId: crew.id, threadId: crew.threadId, from: "worktree" as const, branch: co.branch, path: co.path, environmentId: co.envId, hostId: co.host, running: pending,
       });
       if (named?.branches?.length) {
         const used = new Set<string>();
@@ -3004,8 +3011,8 @@ export default async function plugin(bb: BbPluginApi) {
           let matched: Crew | undefined;
           for (const crew of builders) {
             if (used.has(crew.id)) continue;
-            const { checkout, running } = await checkoutOf(crew);
-            if (checkout && checkout.branch === branch) { matched = crew; sources.push(fromCheckout(crew, checkout, running)); break; }
+            const { checkout, pending } = await checkoutOf(crew);
+            if (checkout && checkout.branch === branch) { matched = crew; sources.push(fromCheckout(crew, checkout, pending)); break; }
           }
           if (matched) { used.add(matched.id); continue; }
           const crew = builders[i] && !used.has(builders[i]!.id) ? builders[i] : undefined;
@@ -3015,8 +3022,8 @@ export default async function plugin(bb: BbPluginApi) {
         continue;
       }
       for (const crew of builders) {
-        const { checkout, running } = await checkoutOf(crew);
-        if (checkout) { sources.push(fromCheckout(crew, checkout, running)); continue; }
+        const { checkout, running, pending } = await checkoutOf(crew);
+        if (checkout) { sources.push(fromCheckout(crew, checkout, pending)); continue; }
         if (running) throw new Error(`Cannot adopt task ${taskId}: crew ${crew.id} is still working outside ${repository}. Name its pushed branch with tasks[].branches, or adopt after it finishes.`);
         const pushed = crew.branch ?? await prHeadBranch(crew.prUrl ?? task.prs[0], hostId);
         if (!pushed) throw new Error(`Cannot adopt task ${taskId}: crew ${crew.id} has no worktree and no known branch. Name its pushed branch with tasks[].branches.`);

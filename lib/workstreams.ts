@@ -427,9 +427,12 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
         } catch (error) { deps.error?.(w, error); }
       }
       const status = job.threadId ? await deps.status(job.threadId) : 'unknown';
+      // An adopted source crew stays pending through a recoverable error: its work is saved and folded only
+      // once it is idle, so what it commits while recovering is in the fold.
+      if (job.adopted && (status === 'error' || status === 'failed')) continue;
       if (status === 'idle' || status === 'archived' || status === 'error' || status === 'failed') {
-        // An adopted crew's saved work is never stranded: an ended or erroring crew still has its work saved and
-        // folded, and the save reads the crew again first, so one that resumed keeps running.
+        // An adopted crew's saved work is never stranded: the save reads the crew again first, so one that works
+        // again keeps running.
         if (job.isolated && !job.adopted && (status === 'error' || status === 'failed' || status === 'archived')) {
           job.state = 'failed';
           job.failedAt = deps.now();

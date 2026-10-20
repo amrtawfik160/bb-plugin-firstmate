@@ -475,16 +475,22 @@ test('check round 1: a later finished crew does not fold into the worktree of a 
   } finally { await p.done(); }
 });
 
-test('check round 1: a running adopted crew whose thread ends in error still folds its saved work', async () => {
+// Changed in check round 2 (allowed assertion change): an erroring adopted crew no longer folds while in error.
+// It folds once idle, and that fold holds the work it committed while recovering.
+test('check round 1: a running adopted crew whose thread ends in error folds its saved work only once idle, recovery work included', async () => {
   const p = await probeWorld();
   try {
     const a = await p.add('a', 'active');
     const { workstream } = await adoptByCard(p.h, { projectId: p.project.id, name: 'Error end', requestId: 'error', taskIds: [a.task.id] });
     p.h.threads.set('thr_a', { status: 'error', envId: 'env_a' });
     await p.h.host.harness.behavior.runSchedule('workstreams');
-    const rows = await p.h.call('workstreams.list', { threadId: 'cap' }) as any;
-    const actual = rows.workstreams.find((w: Row) => w['id'] === workstream.id);
-    assert.equal(actual.jobs[0].state, 'folded', 'an ended adopted crew saved work must not be stranded');
+    const job = async () => ((await p.h.call('workstreams.list', { threadId: 'cap' }) as any).workstreams.find((w: Row) => w['id'] === workstream.id).jobs[0]);
+    assert.notEqual((await job()).state, 'folded', 'an erroring adopted source must wait until idle');
+    writeFileSync(join(a.tree, 'recovered.txt'), 'recovered'); commitAll(a.tree, 'recovered turn');
+    p.h.threads.set('thr_a', { status: 'idle', envId: 'env_a' });
+    await p.h.host.harness.behavior.runSchedule('workstreams');
+    assert.equal((await job()).state, 'folded', 'an ended adopted crew saved work must not be stranded');
+    assert.equal(existsSync(join(workstream.repos[0].path, 'recovered.txt')), true, 'work committed during recovery is in the fold');
   } finally { await p.done(); }
 });
 
@@ -500,5 +506,39 @@ test('check round 1: an adopted crew that recovers from an error and finishes st
     const rows = await p.h.call('workstreams.list', { threadId: 'cap' }) as any;
     const actual = rows.workstreams.find((w: Row) => w['id'] === workstream.id);
     assert.equal(actual.jobs[0].state, 'folded', 'an ended adopted crew saved work must not be stranded');
+  } finally { await p.done(); }
+});
+
+// Check round 2 of PR #182 (VERDICT-REHOME-FM-2.md): the checker's probes, each stating the safe outcome.
+test('check round 2: a recoverable error waits for idle and the fold includes the recovery work', async () => {
+  const p = await probeWorld();
+  try {
+    const a = await p.add('a', 'active');
+    const { workstream } = await adoptByCard(p.h, { projectId: p.project.id, name: 'Recover', requestId: 'recover', taskIds: [a.task.id] });
+    writeFileSync(join(a.tree, 'partial.txt'), 'partial');
+    p.h.threads.set('thr_a', { status: 'error', envId: 'env_a' }); await p.h.host.harness.behavior.runSchedule('workstreams');
+    const rows1 = await p.h.call('workstreams.list', { threadId: 'cap' }) as any;
+    const foldedAtError = rows1.workstreams[0].jobs[0].state === 'folded';
+    p.h.threads.set('thr_a', { status: 'active', envId: 'env_a' }); writeFileSync(join(a.tree, 'recovered.txt'), 'recovered'); commitAll(a.tree, 'recovered turn');
+    await p.h.host.harness.behavior.runSchedule('workstreams');
+    p.h.threads.set('thr_a', { status: 'idle', envId: 'env_a' }); await p.h.host.harness.behavior.runSchedule('workstreams');
+    assert.equal(existsSync(join(workstream.repos[0].path, 'recovered.txt')), true, 'recovered source work must enter the fold after idle');
+    assert.equal(foldedAtError, false, 'an erroring adopted source must wait until idle');
+  } finally { await p.done(); }
+});
+
+test('check round 2: a conflict crew whose turn ended but whose background command runs keeps the workstream worktree', async () => {
+  const p = await probeWorld();
+  try {
+    const a = await p.add('a', 'idle', 'change a\n'); const b = await p.add('b', 'idle', 'change b\n'); const c = await p.add('c', 'active');
+    const { workstream } = await adoptByCard(p.h, { projectId: p.project.id, name: 'Background resolver', requestId: 'bg-resolver', taskIds: [a.task.id, b.task.id, c.task.id] });
+    const repo = workstream.repos[0], resolver = workstream.jobs.find((j: Row) => j['resolves']); assert.equal(resolver.state, 'running');
+    p.h.threads.set('thr_c', { status: 'idle', envId: 'env_c' }); p.h.threads.set(resolver.threadId, { status: 'idle', envId: p.h.threads.get(resolver.threadId)?.envId });
+    p.h.host.harness.sdk.stub('threads.get', async ({ threadId }: { threadId: string }) => {
+      const spec = p.h.threads.get(threadId); if (!spec) throw new Error('fixture missing');
+      return { ...makeThreadResponse({ id: threadId, projectId: p.project.id, status: spec.status as 'idle', ...(spec.envId ? { environmentId: spec.envId } : {}) }), archivedAt: spec.archived ? 1 : null, parentThreadId: threadId === 'cap' ? null : 'cap', activity: threadId === resolver.threadId ? { activeBackgroundCommandCount: 1 } : undefined };
+    });
+    const before = git(repo.path, 'rev-parse', 'HEAD'); await p.h.host.harness.behavior.runSchedule('workstreams'); const after = git(repo.path, 'rev-parse', 'HEAD');
+    assert.equal(after, before, 'running background command still owns resolver worktree');
   } finally { await p.done(); }
 });
