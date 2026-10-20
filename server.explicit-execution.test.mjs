@@ -130,6 +130,22 @@ test('native rebind refuses branch collision and a primary checkout before publi
  writeFileSync(metaPath,f.meta.replace(`worktree=${f.wt}\n`,`worktree=${f.repo}\n`));const primary=invoke({...plan,worktree:f.repo});assert.notEqual(primary.status,0);assert.match(primary.stderr,/isolation guard/);assert.deepEqual(f.invariant(),before);
  }finally{f.clean();}
 });
+// 20 Oct: hermes-split-step3-1020 failed at its first turn (agy refused its model), so it never ran the setup that
+// creates fm/<id>; its retry was refused because refs/heads/fm/hermes-split-step3-1020 did not exist.
+test('native rebind accepts a worker that never started: no task branch, a clean worktree and no commit that no remote has',()=>{
+ const f=replacementFixture();try {
+ const plan={home:f.home,owner:'thr_cap',taskId:'c1',sourceThreadId:'thr_old',threadId:'thr_new',worktree:f.wt,project:f.repo,shape:'ship',mode:'direct-PR',generation:3,providerId:'claude-code',model:'claude-opus-5-5',reasoningLevel:'high'};
+ const invoke=p=>spawnSync('bash',[join(f.home,'bin-bb/fm-worker-rebind.sh'),'--publish'],{input:JSON.stringify(p),encoding:'utf8',env:{...process.env,FM_HOME:f.home,FM_BACKEND:'bb'},timeout:15000});
+ rmSync(join(f.wt,'dirty'));ok(run('git',['-C',f.wt,'checkout','--quiet','-b','bb/ship-c1','main']));ok(run('git',['-C',f.repo,'branch','--quiet','-D','fm/c1','fm/c1-disclosures']));
+ ok(run('git',['-C',f.repo,'update-ref','refs/remotes/origin/main','main']));
+ writeFileSync(join(f.wt,'started'),'work\n');const dirty=invoke(plan);assert.notEqual(dirty.status,0);assert.match(dirty.stderr,/task branch fm\/c1 is missing and the worktree holds work/);
+ ok(run('git',['-C',f.wt,'add','started']));ok(run('git',['-C',f.wt,'commit','--quiet','-m','local only']));const committed=invoke(plan);assert.notEqual(committed.status,0);assert.match(committed.stderr,/task branch fm\/c1 is missing and the worktree holds work/);
+ ok(run('git',['-C',f.wt,'reset','--quiet','--hard','main']));const before=readFileSync(join(f.home,'state/c1.meta'),'utf8');
+ const rebound=invoke(plan);assert.equal(rebound.status,0,rebound.stderr);const meta=readFileSync(join(f.home,'state/c1.meta'),'utf8');
+ assert.match(meta,/^bb_thread_id=thr_new$/m);assert.match(meta,/^branch=fm\/c1$/m,'the replacement creates fm/c1 as its first action');assert.match(meta,/^model=claude-opus-5-5$/m);assert.notEqual(meta,before);
+ assert.equal(run('git',['-C',f.repo,'rev-parse','--verify','--quiet','refs/heads/fm/c1']).status,1,'the rebind writes no branch');
+ }finally{f.clean();}
+});
 test('cache loss recovers current seeded replacement with full task and bounded recovery history, never its archived source',async()=>{
  let {host,state}=await factory();try {
  const first=await host.harness.behavior.runCli(change(),ctx);assert.equal(first.exitCode,0,first.stderr);await host.bb.storage.kv.set('crews',[]);

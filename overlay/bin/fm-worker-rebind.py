@@ -43,7 +43,13 @@ try:
     if plan['shape']=='ship':
         branches=re.findall(r'^Ship branch: (.+)$',body,re.M)
         a.require(len(branches)==1 and fields.get('branch',branches[0])==branches[0],'immutable source branch conflict')
-        a.git(plan['worktree'],'rev-parse','--verify','refs/heads/'+branches[0])
+        try: a.git(plan['worktree'],'rev-parse','--verify','--quiet','refs/heads/'+branches[0])
+        except a.subprocess.CalledProcessError:
+            # A worker that never started never ran the setup that creates its branch (hermes-split-step3-1020,
+            # 20 Oct). A clean worktree with no commit that no remote has holds no work; the replacement
+            # creates the branch as its first action, as a new worker would.
+            a.require(a.git(plan['worktree'],'status','--porcelain')=='' and a.git(plan['worktree'],'rev-list','--count','HEAD','--not','--remotes')=='0',
+                      'task branch '+branches[0]+' is missing and the worktree holds work')
         if 'branch' not in fields: fields['bb_missing_branch']=branches[0]
         fields['branch']=branches[0]
         a.require(fields.get('mode')==plan['mode'],'delivery mode conflict')
