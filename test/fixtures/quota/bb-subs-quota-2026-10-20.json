@@ -1,0 +1,364 @@
+{
+  "now": 1792472993601,
+  "accounts": [
+    {
+      "provider": "antigravity",
+      "account": "redacted-0",
+      "email": "redacted-0",
+      "active": false,
+      "plan": "Google AI Pro",
+      "status": "ready",
+      "checkedAt": 1792472957327,
+      "retrievedAt": 1792472958741,
+      "stale": false,
+      "error": null,
+      "limits": [
+        {
+          "label": "Claude \u00b7 5 hours",
+          "used": 0,
+          "limit": 100,
+          "remaining": 100,
+          "unit": "percent",
+          "resetAt": 1792490958000,
+          "scope": {
+            "kind": "group",
+            "group": "Claude"
+          },
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Claude \u00b7 weekly",
+          "used": 0,
+          "limit": 100,
+          "remaining": 100,
+          "unit": "percent",
+          "resetAt": 1793077758000,
+          "scope": {
+            "kind": "group",
+            "group": "Claude"
+          },
+          "lastKnownRemaining": null
+        }
+      ]
+    },
+    {
+      "provider": "antigravity",
+      "account": "redacted-1",
+      "email": "redacted-1",
+      "active": true,
+      "plan": "Google AI Pro",
+      "status": "ready",
+      "checkedAt": 1792472958741,
+      "retrievedAt": 1792472960122,
+      "stale": false,
+      "error": null,
+      "limits": [
+        {
+          "label": "Claude \u00b7 5 hours",
+          "used": 0,
+          "limit": 100,
+          "remaining": 100,
+          "unit": "percent",
+          "resetAt": 1792490959000,
+          "scope": {
+            "kind": "group",
+            "group": "Claude"
+          },
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Claude \u00b7 weekly",
+          "used": 0,
+          "limit": 100,
+          "remaining": 100,
+          "unit": "percent",
+          "resetAt": 1793077759000,
+          "scope": {
+            "kind": "group",
+            "group": "Claude"
+          },
+          "lastKnownRemaining": null
+        }
+      ]
+    },
+    {
+      "provider": "antigravity",
+      "account": "redacted-2",
+      "email": "redacted-2",
+      "active": false,
+      "plan": "Google AI Pro",
+      "status": "ready",
+      "checkedAt": 1792472960123,
+      "retrievedAt": 1792472961447,
+      "stale": false,
+      "error": null,
+      "limits": [
+        {
+          "label": "Claude \u00b7 5 hours",
+          "used": 0,
+          "limit": 100,
+          "remaining": 100,
+          "unit": "percent",
+          "resetAt": 1792490960000,
+          "scope": {
+            "kind": "group",
+            "group": "Claude"
+          },
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Claude \u00b7 weekly",
+          "used": 0,
+          "limit": 100,
+          "remaining": 100,
+          "unit": "percent",
+          "resetAt": 1793077760000,
+          "scope": {
+            "kind": "group",
+            "group": "Claude"
+          },
+          "lastKnownRemaining": null
+        }
+      ]
+    },
+    {
+      "provider": "cursor",
+      "account": "redacted-3",
+      "email": "redacted-3",
+      "active": true,
+      "plan": "Ultra",
+      "status": "ready",
+      "checkedAt": 1792472961447,
+      "retrievedAt": 1792472992098,
+      "stale": false,
+      "error": null,
+      "limits": [
+        {
+          "label": "Plan usage",
+          "used": 29.65,
+          "limit": 400,
+          "remaining": 370.35,
+          "unit": "usd",
+          "resetAt": 1795125277000,
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Cursor models",
+          "used": 0.9053333333333333,
+          "limit": 100,
+          "remaining": 99.09466666666667,
+          "unit": "percent",
+          "resetAt": 1795125277000,
+          "scope": {
+            "kind": "group",
+            "group": "Cursor models"
+          },
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Other models",
+          "used": 2.4899999999999998,
+          "limit": 100,
+          "remaining": 97.51,
+          "unit": "percent",
+          "resetAt": 1795125277000,
+          "scope": {
+            "kind": "group",
+            "group": "Other models"
+          },
+          "lastKnownRemaining": null
+        }
+      ]
+    },
+    {
+      "provider": "grok",
+      "account": "redacted-4",
+      "email": "redacted-4",
+      "active": true,
+      "plan": "SuperGrok Heavy",
+      "status": "ready",
+      "checkedAt": 1792472992099,
+      "retrievedAt": 1792472992273,
+      "stale": false,
+      "error": null,
+      "limits": [
+        {
+          "label": "Weekly pool",
+          "used": 100,
+          "limit": 100,
+          "remaining": 0,
+          "unit": "percent",
+          "resetAt": 1792591614005,
+          "lastKnownRemaining": null
+        }
+      ]
+    },
+    {
+      "provider": "claude",
+      "account": "redacted-5",
+      "email": "redacted-5",
+      "active": false,
+      "plan": "Max 20x",
+      "status": "ready",
+      "checkedAt": 1792472992273,
+      "retrievedAt": 1792472992587,
+      "stale": false,
+      "error": null,
+      "limits": [
+        {
+          "label": "5-hour window",
+          "used": 0,
+          "limit": 100,
+          "remaining": 100,
+          "unit": "percent",
+          "resetAt": null,
+          "windowMs": 18000000,
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Weekly window",
+          "used": 80,
+          "limit": 100,
+          "remaining": 20,
+          "unit": "percent",
+          "resetAt": 1792627200478,
+          "windowMs": 604800000,
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Fable \u00b7 weekly",
+          "used": 16,
+          "limit": 100,
+          "remaining": 84,
+          "unit": "percent",
+          "resetAt": 1792627200478,
+          "windowMs": 604800000,
+          "scope": {
+            "kind": "group",
+            "group": "Fable"
+          },
+          "lastKnownRemaining": null
+        }
+      ]
+    },
+    {
+      "provider": "claude",
+      "account": "redacted-6",
+      "email": "redacted-6",
+      "active": false,
+      "plan": "Max 20x",
+      "status": "ready",
+      "checkedAt": 1792472992587,
+      "retrievedAt": 1792472992933,
+      "stale": false,
+      "error": null,
+      "limits": [
+        {
+          "label": "5-hour window",
+          "used": 0,
+          "limit": 100,
+          "remaining": 100,
+          "unit": "percent",
+          "resetAt": null,
+          "windowMs": 18000000,
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Weekly window",
+          "used": 93,
+          "limit": 100,
+          "remaining": 7,
+          "unit": "percent",
+          "resetAt": 1792670399828,
+          "windowMs": 604800000,
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Fable \u00b7 weekly",
+          "used": 12,
+          "limit": 100,
+          "remaining": 88,
+          "unit": "percent",
+          "resetAt": 1792670399829,
+          "windowMs": 604800000,
+          "scope": {
+            "kind": "group",
+            "group": "Fable"
+          },
+          "lastKnownRemaining": null
+        }
+      ]
+    },
+    {
+      "provider": "claude",
+      "account": "redacted-7",
+      "email": "redacted-7",
+      "active": true,
+      "plan": "Team 5x",
+      "status": "ready",
+      "checkedAt": 1792472992933,
+      "retrievedAt": 1792472993230,
+      "stale": false,
+      "error": null,
+      "limits": [
+        {
+          "label": "5-hour window",
+          "used": 94,
+          "limit": 100,
+          "remaining": 6,
+          "unit": "percent",
+          "resetAt": 1792478400102,
+          "windowMs": 18000000,
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Fable \u00b7 weekly",
+          "used": 5,
+          "limit": 100,
+          "remaining": 95,
+          "unit": "percent",
+          "resetAt": 1792483200102,
+          "windowMs": 604800000,
+          "scope": {
+            "kind": "group",
+            "group": "Fable"
+          },
+          "lastKnownRemaining": null
+        }
+      ]
+    },
+    {
+      "provider": "codex",
+      "account": "redacted-8",
+      "email": "redacted-8",
+      "active": true,
+      "plan": "pro",
+      "status": "ready",
+      "checkedAt": 1792472993230,
+      "retrievedAt": 1792472993600,
+      "stale": false,
+      "error": null,
+      "limits": [
+        {
+          "label": "Weekly window",
+          "used": 64,
+          "limit": 100,
+          "remaining": 36,
+          "unit": "percent",
+          "resetAt": 1792874456000,
+          "windowMs": 604800000,
+          "lastKnownRemaining": null
+        },
+        {
+          "label": "Credit balance",
+          "used": null,
+          "limit": null,
+          "remaining": 53327.561897,
+          "unit": "credits",
+          "resetAt": null,
+          "lastKnownRemaining": null
+        }
+      ]
+    }
+  ]
+}
