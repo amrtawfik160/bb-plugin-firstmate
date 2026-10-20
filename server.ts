@@ -2510,7 +2510,7 @@ export default async function plugin(bb: BbPluginApi) {
       const payload = workstreamCardInput({
         workstreamId: w.id,
         revision: w.cardRevision ?? 0,
-        tasks: w.jobs.slice(0, 50).map((job) => {
+        tasks: w.jobs.map((job) => {
           const task = job.taskId ? ownerTasks.get(job.taskId) : undefined;
           return {
             task: job.taskId ?? job.id,

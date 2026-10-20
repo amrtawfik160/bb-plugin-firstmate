@@ -120,6 +120,12 @@ export type WorkstreamCardTask = {
   note?: string;
 };
 
+// The connector refuses the whole card for a task ID that is not T<n> or is longer than 24
+// characters, so a crew whose owner task is not attached yet stays off the card.
+export function isCardTaskId(task: string): boolean {
+  return task.length <= 24 && /^T\d+$/.test(task);
+}
+
 export function workstreamCardInput(input: {
   workstreamId: string;
   revision: number;
@@ -128,7 +134,7 @@ export function workstreamCardInput(input: {
   return {
     workstreamId: input.workstreamId,
     revision: input.revision,
-    tasks: input.tasks.slice(0, 50).map((task) => ({
+    tasks: input.tasks.filter((task) => isCardTaskId(task.task)).slice(0, 50).map((task) => ({
       task: task.task,
       title: task.title.slice(0, 80),
       model: task.model.slice(0, 40),

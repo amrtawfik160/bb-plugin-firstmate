@@ -125,6 +125,11 @@ test('fake BB: two created editing tasks start together on their own worktrees w
     assert.equal((spawned[0]!.pluginMetadata as Record<string,unknown>).deliveryRequirement,'pr','an editing crew delivers its PR; Ship owns merging');
     assert.ok(cards.length >= 1);
     assert.equal(typeof cards[0]!.revision, 'number');
+    await new Promise((resolve) => setImmediate(resolve));
+    const cardTasks = cards.map((card) => (card.tasks as Array<{ task: string; state: string }>));
+    assert.ok(cardTasks.flat().every((task) => /^T\d+$/.test(task.task)), 'the live connector refuses a card with a crew id in place of T<n>');
+    assert.deepEqual(cardTasks.at(-1)!.map((task) => `${task.task}:${task.state}`), ['T1:working', 'T2:working', 'T3:working']);
+    assert.ok(cards.every((card, index) => index === 0 || (card.revision as number) > (cards[index - 1]!.revision as number)));
     const view = await host.harness.inspection.registrations.agentTools.find((t) => t.name === 'firstmate_workstream')!.execute({ action: 'view', workstreamId: w.id }, ctx);
     assert.match(typeof view === 'string' ? view : JSON.stringify(view), /working|folded|queued/);
     const listed = await host.harness.behavior.callRpc('workstreams.list',{threadId:'cap'}) as {workstreams:Array<{taskIds:string[]}>};

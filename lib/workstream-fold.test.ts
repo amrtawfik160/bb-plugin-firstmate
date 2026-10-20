@@ -91,3 +91,16 @@ test("the status card payload clips title, model and note and keeps revision", (
   assert.equal(payload.tasks[0]!.model.length, 40);
   assert.equal(payload.tasks[0]!.note?.length, 120);
 });
+
+test("the status card payload sends only T<n> task IDs of at most 24 characters", () => {
+  const payload = workstreamCardInput({
+    workstreamId: "ws-1",
+    revision: 1,
+    tasks: [
+      { task: "editor-two", title: "crew before its task attaches", model: "m", state: "working" },
+      { task: "T2", title: "attached", model: "m", state: "working" },
+      { task: `T${"9".repeat(24)}`, title: "too long", model: "m", state: "queued" },
+    ],
+  });
+  assert.deepEqual(payload.tasks.map((task) => task.task), ["T2"]);
+});

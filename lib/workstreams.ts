@@ -336,8 +336,11 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
       const w = open(id, threadId);
       const job = w.jobs.find((j) => j.id === jobId);
       if (!job) throw new Error('No workstream crew with that id.');
+      const attached = patch.taskId !== undefined && patch.taskId !== job.taskId;
       Object.assign(job, patch);
       save(w);
+      // The card lists only crews with an owner task, so show this one as soon as its task attaches.
+      if (attached) void serial(async () => bumpCard(open(id, threadId))).catch((error) => deps.error?.(w, error));
       return job;
     },
     view: (id: string, threadId: string) => {
