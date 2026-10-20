@@ -29,7 +29,8 @@ export type FoldOps = {
   /** Read-only: one step per repository of the task, or why the fold must wait. */
   plan: (w: Workstream, job: WorkstreamJob) => Promise<{ steps: FoldStep[] } | { wait: string }>;
   merge: (w: Workstream, step: FoldStep) => Promise<{ kind: 'merged'; after: string; files: string[] } | { kind: 'conflict' } | { kind: 'wait'; reason: string }>;
-  inspect: (w: Workstream, step: FoldStep) => Promise<{ head: string; hasTarget: boolean }>;
+  /** The workstream head, whether it holds the task commit, and the files changed since the step's `before`. */
+  inspect: (w: Workstream, step: FoldStep) => Promise<{ head: string; hasTarget: boolean; files: string[] }>;
   /** False when the undo must wait, for example for a local change in a file the fold changed. */
   rollback: (w: Workstream, step: FoldStep) => Promise<boolean>;
 };
@@ -56,7 +57,9 @@ export type WorkstreamDeps = {
   devActivity?: (w: Workstream) => Promise<number>;
   stopDev: (w: Workstream) => Promise<void>;
   unsaved: (repo: WorkstreamRepo) => Promise<string[]>;
-  remove: (repo: WorkstreamRepo) => Promise<void>;
+  /** Why End must keep this workstream worktree (another thread still uses it); null when it may go. */
+  keepWorktree?: (w: Workstream, repo: WorkstreamRepo) => Promise<string | null>;
+  remove: (repo: WorkstreamRepo, w: Workstream) => Promise<void>;
   ship: (w: Workstream) => Promise<void>;
   taskState: (id: string) => string | undefined;
   busy?: (w: Workstream) => Promise<boolean>;
@@ -85,7 +88,8 @@ function keptUnsaved(job: WorkstreamJob): boolean {
 
 function jobClosed(job: WorkstreamJob): boolean {
   if (keptUnsaved(job) || job.cleanup === 'pending') return false;
-  if (!job.editing) return job.state === 'finished' || job.state === 'dropped';
+  // Scouts, adopted editors, and editors saved before task worktrees close as before: when finished.
+  if (!job.isolated) return job.state === 'finished' || job.state === 'dropped' || job.state === 'folded';
   return job.state === 'folded' || job.state === 'dropped' || job.state === 'failed';
 }
 
@@ -254,14 +258,23 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
     const ops = deps.foldOps;
     if (!ops) return;
     if (fold.state === 'merging') {
+      // The changed files are read again from each saved original head, so a landed fold whose result
+      // was lost still restarts the dev link and shows its files.
+      const files = new Set<string>();
       try {
         for (const step of fold.steps) {
           const seen = await ops.inspect(w, step);
-          if (seen.hasTarget) { step.state = 'merged'; step.after ??= seen.head; }
+          if (seen.hasTarget) { step.state = 'merged'; step.after ??= seen.head; for (const file of seen.files) files.add(file); }
           else step.state = 'pending';
         }
       } catch (error) { deps.error?.(w, error); return; }
-      if (fold.steps.every((step) => step.state === 'merged')) { fold.state = 'committed'; save(w); await finishFold(w, job); return; }
+      if (fold.steps.every((step) => step.state === 'merged')) {
+        fold.files = [...files];
+        fold.state = 'committed';
+        save(w);
+        await finishFold(w, job);
+        return;
+      }
       fold.state = 'rolling-back';
       fold.reason = 'restart';
       save(w);
@@ -352,7 +365,8 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
     for (const job of w.jobs) {
       if (deps.signal?.aborted) return;
       if (job.state !== 'queued' && job.state !== 'starting' && job.state !== 'waiting-memory') continue;
-      if (!created) {
+      // Adopted editors, and editors saved before task worktrees, share the workstream worktree: one at a time.
+      if (!created || (job.editing && !job.isolated)) {
         if (job.editing && w.jobs.some((j) => j.id !== job.id && j.editing && (j.state === 'running' || j.state === 'starting'))) continue;
         if (job.editing && (w.ship.state === 'running' || w.ship.state === 'queued')) continue;
         if (job.editing && await (deps.editorBusy ?? deps.busy)?.(w)) continue;
@@ -420,12 +434,14 @@ export function createWorkstreams(db: Database, deps: WorkstreamDeps) {
         if (repo.existing) continue;
         const findings = await deps.unsaved(repo);
         if (findings.length) throw new Error(`Unsaved work: ${findings.join(', ')}`);
+        const kept = await deps.keepWorktree?.(w, repo);
+        if (kept) throw new Error(`Workstream worktree kept: ${kept}`);
       }
       w.cleanupApproved = true; save(w);
       await stop(w);
       for (const repo of w.repos) {
         if (repo.existing) continue;
-        await deps.remove(repo);
+        await deps.remove(repo, w);
       }
       // Private chat cannot close or reopen a topic (conversation-topics rule 7).
       w.state = 'ended'; w.closeTopicRequested = false; w.updatedAt = deps.now(); return save(w);

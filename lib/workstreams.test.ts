@@ -521,7 +521,10 @@ function foldGit(repos: string[]) {
       if (crashAfterMerge) throw new Error('host connection lost');
       return { kind: 'merged', after: `${step.repository}-merged`, files: [`${step.repository}.ts`] };
     },
-    inspect: async (_w, step) => ({ head: heads.get(step.repository)!, hasTarget: heads.get(step.repository) === `${step.repository}-merged` }),
+    inspect: async (_w, step) => {
+      const merged = heads.get(step.repository) === `${step.repository}-merged`;
+      return { head: heads.get(step.repository)!, hasTarget: merged, files: merged ? [`${step.repository}.ts`] : [] };
+    },
     rollback: async (_w, step) => {
       calls.push(`undo ${step.repository}`);
       if (!rollbackOk) return false;
@@ -736,5 +739,35 @@ test('compact view shows the latest job of each task once', async () => {
     await f.store.reconcile();
     await f.store.submit(w.id, 'cap', { id: 'second', editing: true, payload: '{}', taskId: 'T3', title: 'Restyle', followUpOf: 'first' });
     assert.deepEqual(f.store.view(w.id, 'cap').split('\n'), ['T3 Restyle default working']);
+  } finally { f.db.close(); }
+});
+
+test('a finished adopted editor, and one saved before task worktrees, close under the old rule so End works', async () => {
+  const f = fixture();
+  try {
+    const adopted = await f.store.adopt({ threadId: 'cap', projectId: 'cyndra', name: 'Adopted', requestId: 'adopt-end', taskIds: ['T1'] });
+    await f.store.submit(adopted.id, 'cap', { id: 'editor', editing: true, payload: '{}' });
+    assert.equal(f.store.get(adopted.id, 'cap').jobs[0]!.isolated, undefined);
+    f.statuses.set('editor', 'idle');
+    await f.store.reconcile();
+    assert.equal(f.store.get(adopted.id, 'cap').jobs[0]!.state, 'finished');
+    assert.equal(f.store.get(adopted.id, 'cap').state, 'ended', 'automatic End runs once every task is Live');
+  } finally { f.db.close(); }
+});
+
+test('an editor saved before task worktrees waits for the running editor, as it did then', async () => {
+  const f = fixture();
+  try {
+    const w = await f.create();
+    await f.store.submit(w.id, 'cap', { id: 'task', editing: true, payload: '{}' });
+    const saved = f.store.get(w.id, 'cap');
+    saved.jobs.push({ id: 'legacy', editing: true, payload: '{}', state: 'queued', threadId: null });
+    f.db.prepare('UPDATE firstmate_workstream SET record=? WHERE id=?').run(JSON.stringify(saved), w.id);
+    await f.store.reconcile();
+    assert.deepEqual(f.started, ['task'], 'the shared workstream worktree has one editor at a time');
+    f.statuses.set('task', 'idle');
+    await f.store.reconcile();
+    assert.ok(f.started.includes('legacy'));
+    assert.equal(f.store.get(w.id, 'cap').jobs.find((j) => j.id === 'legacy')!.isolated, undefined);
   } finally { f.db.close(); }
 });

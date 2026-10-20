@@ -121,6 +121,7 @@ import { addCorrection, CAPTAIN_FILE, CORRECTION_RULE, correctionBrief, fixCorre
 import { renderScorecard, type ScorecardData } from "./owner/scorecard.ts";
 import { createQualityEvents } from "./lib/quality-events.ts";
 import { rpcContract, workstreamListSchema, workstreamResultSchema, workstreamDevLinkSchema } from "./rpc.ts";
+import { archiveWithUndo } from "./lib/workstream-archive.ts";
 import { createWorkstreams, shipSnapshotOf, WorkstreamWaiting, type Workstream, type WorkstreamRepo, type WorkstreamJob, type FoldStep } from "./lib/workstreams.ts";
 import { provisionScript, takeMainScript, unshippedScript, devStartScript, devUnit, devActivityPath, foldScript, foldPlanScript, foldInspectScript, rollbackFoldScript, deleteTaskBranchScript } from "./lib/workstream-runtime.ts";
 import {
@@ -129,6 +130,7 @@ import {
   currentJobs,
   foldValue,
   isAdoptedWorkstream,
+  parseFoldInspect,
   jobToCardState,
   memAvailableBytes,
   parseFoldOutput,
@@ -2326,72 +2328,83 @@ export default async function plugin(bb: BbPluginApi) {
     return [...new Set(own.flatMap((j) => [j.environmentId, ...(j.repos ?? []).map((r) => r.environmentId)]))]
       .filter((id): id is string => typeof id === "string" && id !== "" && !workstreamEnvs.has(id));
   }
-  // Threads a workstream cleanup is archiving. Their "thread archived" effects wait for its verdict:
-  // a verified archive gets them, an undone archive never does.
-  const workstreamArchiving = new Set<string>();
+  // While a workstream cleanup archives (task crews after a fold, the workstream worktree at End), every
+  // "thread archived" event waits: BB's archive can take threads the cleanup never named, and an archive
+  // it undoes must leave delivery ownership and inbound delegation alone. Afterwards each waiting event
+  // applies only if its thread is still archived, once per archive.
+  let archiveTransactions = 0;
+  const deferredArchiveEvents = new Set<string>();
+  const appliedArchiveEffects = new Set<string>();
   const loggedWorkstreamUndos = new Set<string>();
-  const threadRunning = (row: Record<string, unknown>) => !["idle", "error", "failed", "archived"].includes(String(row["status"])) || backgroundBusy(row);
-  /**
-   * BB's archive has no idle check, and its teardown keeps a turn running for a 30-second grace.
-   * So the thread and its worktree are read again right after the archive. A turn or background work
-   * that started meanwhile, a failed archive, or any other thread BB archived with it undoes the
-   * archive within that grace. Returns why it was undone, or null when the archive stands.
-   */
-  async function archiveVerified(threadId: string, envIds: string[]): Promise<string | null> {
-    workstreamArchiving.add(threadId);
-    let verified = false;
-    try {
-      let taken: string[];
-      try {
-        const ids = asRecord(await bb.sdk.threads.archive({ threadId }))["archivedThreadIds"];
-        taken = Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [threadId];
-      } catch (error) {
-        // The request may still have reached BB; nothing verified it, so undo it.
-        return await undoArchive(threadId, [threadId], `archive failed (${error instanceof Error ? error.message : String(error)})`);
+  async function withArchiveTransaction<T>(operation: () => Promise<T>): Promise<T> {
+    archiveTransactions++;
+    try { return await operation(); } finally {
+      archiveTransactions--;
+      if (archiveTransactions === 0) {
+        const ids = [...deferredArchiveEvents];
+        deferredArchiveEvents.clear();
+        for (const id of ids) await archivedEffectsIfCurrent(id).catch((error) => bb.log.warn(`thread archived ${id}: ${String(error)}`));
       }
-      const others = taken.filter((id) => id !== threadId);
-      let reason: string | null = others.length > 0 ? `BB also archived ${others.join(", ")}` : null;
-      if (reason === null) {
-        try {
-          const after = asRecord(await bb.sdk.threads.get({ threadId }));
-          let started = threadRunning(after);
-          for (const environmentId of envIds) {
-            if (started) break;
-            started = threadRows(await bb.sdk.threads.list({ environmentId, includeHidden: true })).some(threadRunning);
-          }
-          if (started) reason = "work started while archiving";
-        } catch (error) {
-          reason = `not verified after archiving (${error instanceof Error ? error.message : String(error)})`;
-        }
-      }
-      if (reason === null) { verified = true; return null; }
-      return await undoArchive(threadId, taken.includes(threadId) ? taken : [threadId, ...taken], reason);
-    } finally {
-      workstreamArchiving.delete(threadId);
-      if (verified) await threadArchivedEffects(threadId).catch((error) => bb.log.warn(`thread archived ${threadId}: ${String(error)}`));
     }
   }
-  // The crew thread first: BB refuses to unarchive a lifecycle dependent before its owner.
-  async function undoArchive(threadId: string, taken: string[], reason: string): Promise<string> {
-    const failed: string[] = [];
-    for (const id of [threadId, ...taken.filter((id) => id !== threadId)]) {
-      try { await bb.sdk.threads.unarchive({ threadId: id }); }
-      catch (error) { failed.push(`${id} (${error instanceof Error ? error.message : String(error)})`); }
-    }
-    const detail = failed.length === 0 ? `${reason}; archive undone` : `${reason}; undo failed for ${failed.join(", ")}`;
-    if (failed.length > 0) bb.log.warn(`workstream task cleanup: ${threadId}: ${detail}`);
+  // A late or repeated event for an archive that was undone, also after a pass ends or a reload, finds the
+  // thread live again and changes nothing.
+  async function archivedEffectsIfCurrent(threadId: string): Promise<void> {
+    let archivedAt: unknown = "unreadable";
+    try { archivedAt = asRecord(await bb.sdk.threads.get({ threadId }))["archivedAt"]; } catch { /* a thread BB cannot read is gone */ }
+    if (archivedAt == null) return;
+    const key = `${threadId}:${String(archivedAt)}`;
+    if (appliedArchiveEffects.has(key)) return;
+    appliedArchiveEffects.add(key);
+    await threadArchivedEffects(threadId);
+  }
+  /**
+   * Archive one crew thread inside an archive transaction (lib/workstream-archive.ts): read it and its
+   * worktree back at once and undo the archive within BB's grace when work started, the archive failed,
+   * or BB took other threads. Returns why it was undone, or null when the archive stands.
+   */
+  async function archiveVerified(threadId: string, envIds: string[]): Promise<string | null> {
+    const result = await archiveWithUndo({
+      now: Date.now,
+      within: (call, ms) => raceAbort(call(), undefined, ms),
+      archive: async (id) => {
+        const ids = asRecord(await bb.sdk.threads.archive({ threadId: id }))["archivedThreadIds"];
+        return Array.isArray(ids) ? ids.filter((value): value is string => typeof value === "string") : [id];
+      },
+      threadBusy: async (id) => threadRunning(asRecord(await bb.sdk.threads.get({ threadId: id }))),
+      environmentBusy: async (environmentId) => threadRows(await bb.sdk.threads.list({ environmentId, includeHidden: true })).some(threadRunning),
+      unarchive: async (id) => { await bb.sdk.threads.unarchive({ threadId: id }); },
+    }, threadId, envIds);
+    for (const id of result.taken) deferredArchiveEvents.add(id);
+    if (!result.undone) return null;
+    const detail = result.failed.length === 0 ? `${result.reason}; archive undone` : `${result.reason}; undo failed for ${result.failed.join(", ")}`;
+    if (result.failed.length > 0) bb.log.warn(`workstream task cleanup: ${threadId}: ${detail}`);
     else if (!loggedWorkstreamUndos.has(threadId)) {
       loggedWorkstreamUndos.add(threadId);
       bb.log.warn(`workstream task cleanup: ${threadId}: ${detail}; worktree kept`);
     }
     return detail;
   }
-  // What an archive of these crews would touch, read fresh: their threads, children, lifecycle and
-  // source dependents, parent, the other threads in their worktrees, and open tasks that still hold them.
+  const threadRunning = (row: Record<string, unknown>) => !["idle", "error", "failed", "archived"].includes(String(row["status"])) || backgroundBusy(row);
+  // Each crew's lifecycle lock, in id order, so no Firstmate tell or retry starts one of them meanwhile.
+  function withCrewLocks<T>(crewIds: string[], operation: () => Promise<T>): Promise<T> {
+    return [...new Set(crewIds)].sort().reduceRight<() => Promise<T>>((next, id) => () => crewControl(id, next), operation)();
+  }
+  type ArchiveScope = { threadIds: string[]; crewIds: string[]; taskIds: Set<string>; envIds: string[]; jobIds: Set<string> };
+  function taskArchiveScope(w: Workstream, own: WorkstreamJob[]): ArchiveScope {
+    return {
+      threadIds: own.flatMap((j) => (j.threadId ? [j.threadId] : [])), crewIds: own.map((j) => j.id),
+      taskIds: new Set(own.flatMap((j) => (j.taskId ? [j.taskId] : []))), envIds: taskEnvironments(w, own), jobIds: new Set(own.map((j) => j.id)),
+    };
+  }
   async function taskArchiveFacts(w: Workstream, own: WorkstreamJob[]): Promise<Parameters<typeof archiveKeepReason>[0] | { kept: string }> {
+    return archiveFacts(w, taskArchiveScope(w, own));
+  }
+  // What an archive of these threads would touch, read fresh: the threads, children, lifecycle and source
+  // dependents, parent, the other threads in their worktrees, and open tasks or crews that still hold them.
+  async function archiveFacts(w: Workstream, scope: ArchiveScope): Promise<Parameters<typeof archiveKeepReason>[0] | { kept: string }> {
     try {
-      const ownIds = new Set(own.map((j) => j.id));
-      const threadIds = own.flatMap((j) => (j.threadId ? [j.threadId] : []));
+      const { threadIds } = scope;
       const threads: Array<{ id: string; status: string; busy: boolean; archived: boolean; children: number; dependents: number }> = [];
       let parentRunning = false;
       for (const id of threadIds) {
@@ -2412,26 +2425,66 @@ export default async function plugin(bb: BbPluginApi) {
         if (!rows) return { kept: "too many project threads to check for lifecycle dependents" };
         for (const thread of threads) thread.dependents += rows.filter((r) => liveRow(r) && r["lifecycleOwnerThreadId"] === thread.id).length;
       }
-      const envIds = taskEnvironments(w, own);
       const others = new Set<string>();
-      for (const environmentId of envIds) {
+      for (const environmentId of scope.envIds) {
         for (const row of threadRows(await bb.sdk.threads.list({ environmentId, includeHidden: true }))) {
           if (liveRow(row) && typeof row["id"] === "string" && !threadIds.includes(row["id"])) others.add(row["id"]);
         }
       }
-      const ownTasks = new Set(own.flatMap((j) => (j.taskId ? [j.taskId] : [])));
       const heldBy: string[] = [];
       for (const task of ownerTasks.list(w.threadId, { includeClosed: true })) {
-        if (!ownTasks.has(task.id) && isOpenTask(task) && own.some((j) => task.crewIds.includes(j.id))) heldBy.push(`task ${task.id}`);
+        if (!scope.taskIds.has(task.id) && isOpenTask(task) && scope.crewIds.some((id) => task.crewIds.includes(id))) heldBy.push(`task ${task.id}`);
       }
       for (const other of w.jobs) {
-        if (ownIds.has(other.id) || other.cleanup === "done" || (other.state === "dropped" && !other.threadId)) continue;
-        if (envIds.some((id) => id === other.environmentId || other.repos?.some((r) => r.environmentId === id))) heldBy.push(`crew ${other.id}`);
+        if (scope.jobIds.has(other.id) || other.cleanup === "done" || (other.state === "dropped" && !other.threadId)) continue;
+        if (scope.envIds.some((id) => id === other.environmentId || other.repos?.some((r) => r.environmentId === id))) heldBy.push(`crew ${other.id}`);
       }
       return { threads, parentRunning, others: [...others], heldBy };
     } catch (error) {
       return { kept: `its thread state is unreadable (${error instanceof Error ? error.message : String(error)})` };
     }
+  }
+  // End removes the workstream worktree only when every live thread in its environment is a crew of this
+  // workstream that the task-crew rules let go; any other thread (an owner's own thread, say) keeps it.
+  async function workstreamWorktreeScope(w: Workstream, repo: WorkstreamRepo): Promise<ArchiveScope | { kept: string }> {
+    const envIds = repo.environmentId ? [repo.environmentId] : [];
+    const rows = repo.environmentId ? threadRows(await bb.sdk.threads.list({ environmentId: repo.environmentId, includeHidden: true })).filter(liveRow) : [];
+    const crews = await readCrews();
+    const own: Crew[] = [];
+    for (const row of rows) {
+      const id = typeof row["id"] === "string" ? row["id"] : "";
+      const crew = crews.find((c) => c.threadId === id && c.workstreamId === w.id);
+      if (!crew) return { kept: `thread ${id || "(unknown)"} still uses it and is not a crew of this workstream` };
+      own.push(crew);
+    }
+    return { threadIds: own.map((c) => c.threadId), crewIds: own.map((c) => c.id), taskIds: new Set(), envIds, jobIds: new Set(own.map((c) => c.id)) };
+  }
+  async function workstreamWorktreeKeepReason(w: Workstream, repo: WorkstreamRepo): Promise<string | null> {
+    try {
+      const scope = await workstreamWorktreeScope(w, repo);
+      if ("kept" in scope) return scope.kept;
+      const facts = await archiveFacts(w, scope);
+      return "kept" in facts ? facts.kept : archiveKeepReason(facts);
+    } catch (error) { return `its threads are unreadable (${error instanceof Error ? error.message : String(error)})`; }
+  }
+  async function archiveWorkstreamWorktree(w: Workstream, repo: WorkstreamRepo): Promise<string | null> {
+    const first = await workstreamWorktreeScope(w, repo).catch((error: unknown) => ({ kept: `its threads are unreadable (${String(error)})` }));
+    if ("kept" in first) return first.kept;
+    return withCrewLocks(first.crewIds, () => withArchiveTransaction(async () => {
+      // Read again under the locks: a thread may have started or joined the worktree meanwhile.
+      const scope = await workstreamWorktreeScope(w, repo);
+      if ("kept" in scope) return scope.kept;
+      const facts = await archiveFacts(w, scope);
+      if ("kept" in facts) return facts.kept;
+      const reason = archiveKeepReason(facts);
+      if (reason) return reason;
+      for (const thread of facts.threads) {
+        if (thread.archived) continue;
+        const undone = await archiveVerified(thread.id, scope.envIds);
+        if (undone) return undone;
+      }
+      return null;
+    }));
   }
   // Both dispatch paths (firstmate_dispatch and `bb firstmate dispatch`) attach a workstream crew's owner
   // task to its job, which sends the status card again, and continue a task the same way.
@@ -2499,7 +2552,7 @@ export default async function plugin(bb: BbPluginApi) {
         ...input, task:input.task, crewId:job.id, projectId:original.projectId, parentThreadId:w.threadId, workstreamId:w.id,
         providerNamed:original.providerNamed, permissionMode:toPermissionMode(original.permissionMode), reasoningLevel:toReasoningLevel(input.reasoningLevel),
         worktree: job.isolated === true, visible:input.visible !== false, shape:input.shape ?? "ship", mode:input.mode ?? "direct-PR", yolo:original.yolo,
-        reuseEnvironmentId: job.environmentId ?? undefined, baseBranch: job.baseBranch,
+        reuseEnvironmentId: job.environmentId ?? undefined, baseBranch: job.baseBranch, workstreamTask: job.isolated === true,
       }));
       if (job.isolated) {
         try { Object.assign(job, await taskCheckout(w, job, crew.threadId) ?? {}); }
@@ -2561,9 +2614,12 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return unsavedWorkFindings(await workstreamCommand(repo, `bash -c ${shQuote(UNSAVED_WORK_SCRIPT)} check ${shQuote(repo.path)} ${shQuote(basename(repo.branch))}`));
     },
-    remove: async (repo) => {
+    keepWorktree: (w, repo) => workstreamWorktreeKeepReason(w, repo),
+    remove: async (repo, w) => {
       const exists = await workstreamCommand(repo, `if [ -d ${shQuote(repo.path)} ]; then echo present; else echo absent; fi`);
-      if (repo.environmentId) await bb.sdk.environments.archiveThreads({environmentId:repo.environmentId});
+      // Each crew thread in the worktree is archived under the task-crew rules, never the environment at once.
+      const kept = await archiveWorkstreamWorktree(w, repo);
+      if (kept) throw new Error(`Workstream worktree kept: ${kept}`);
       if (exists === "absent") return;
       await workstreamCommand(repo, `git -C ${shQuote(repo.sourcePath)} worktree remove ${shQuote(repo.path)}`);
     },
@@ -2635,12 +2691,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (!parsed.ok || !parsed.head) throw new Error("The fold returned no result.");
         return { kind: "merged", after: parsed.head, files: parsed.files };
       },
-      inspect: async (w, step) => {
-        const output = await workstreamCommand(foldRepo(w, step), `bash -c ${shQuote(foldInspectScript(step.workstreamPath, step.target))}`);
-        const head = foldValue(output, "HEAD");
-        if (!head) throw new Error("The fold check returned no head.");
-        return { head, hasTarget: foldValue(output, "HAS_TARGET") === "yes" };
-      },
+      inspect: async (w, step) => parseFoldInspect(await workstreamCommand(foldRepo(w, step), `bash -c ${shQuote(foldInspectScript(step.workstreamPath, step.target, step.before))}`)),
       rollback: async (w, step) => {
         const output = await workstreamCommand(foldRepo(w, step), `bash -c ${shQuote(rollbackFoldScript(step.workstreamPath, step.before, step.after ?? step.before))}`);
         if (output.includes("FOLD_ROLLED_BACK")) return true;
@@ -2675,11 +2726,15 @@ export default async function plugin(bb: BbPluginApi) {
       const late = archiveKeepReason(after);
       if (late) return { kept: late };
       const envIds = taskEnvironments(again.fresh, again.jobs);
-      for (const thread of after.threads) {
-        if (thread.archived) continue;
-        const undone = await archiveVerified(thread.id, envIds);
-        if (undone) return { kept: undone };
-      }
+      const undone = await withArchiveTransaction(async () => {
+        for (const thread of after.threads) {
+          if (thread.archived) continue;
+          const reason = await archiveVerified(thread.id, envIds);
+          if (reason) return reason;
+        }
+        return null;
+      });
+      if (undone) return { kept: undone };
     }),
     deleteBranch: async (w, job) => {
       for (const checkout of jobCheckouts(job)) {
@@ -2911,7 +2966,9 @@ export default async function plugin(bb: BbPluginApi) {
         if (known && (await crewStatus(known)) === "idle") throw error;
         throw new WorkstreamWaiting(`Independent checker pending for ${pr.url}`);
       }
-      await mergeCrew(builder,true,undefined,undefined,{caller:w.threadId,keepCrew:true,pr:pr.url});
+      // A created workstream lands its own PR at the Ship head; an adopted one lands the crew's PR from its worktree.
+      if (snapshot) await mergeWorkstreamPr(builder, target, { hostId: repo.hostId, environmentId: repo.environmentId, head, caller: w.threadId });
+      else await mergeCrew(builder,true,undefined,undefined,{caller:w.threadId,keepCrew:true,pr:pr.url});
       await workstreamCommand(repo,`bash -c ${shQuote(takeMainScript(repo))}`);
     }
     await bb.storage.kv.delete(`${LIVE_PASS_AT_PREFIX}${w.threadId}`);
@@ -2925,6 +2982,37 @@ export default async function plugin(bb: BbPluginApi) {
       if (!known) await dispatchCrewUnqueued({task:`Prepare the release of merged workstream ${w.id}. Request any missing publication approval from the captain before making it live. A merge approval alone does not authorize publication. Tasks: ${shippedTasks.join(", ")}. Follow this project path: ${rule?.live?.next ?? "ask the captain to name the project live path"}. Record live evidence with the existing Firstmate task and live-check tools. Do not merge other work or create a new worktree.`,crewId,projectId:w.projectId,parentThreadId:w.threadId,workstreamId:w.id,role:"builder",shape:"ship",mode:"direct-PR",worktree:false,visible:true});
       throw new WorkstreamWaiting(`Merged work awaits the project live check: ${rule?.live?.missing ?? rule?.live?.next ?? "live path missing"}`);
     }
+  }
+
+  // Ship's merge of a created workstream's PR. The PR's branch is the workstream branch, so the merge runs on
+  // the workstream repository's host and is bound to the head Ship pushed; the folded builder is only its
+  // provenance (owner approval, verification record, checker model). A task crew's own PR never lands here.
+  async function mergeWorkstreamPr(builder: Crew, pr: MergeTarget, ship: { hostId: string; environmentId: string | null; head: string; caller: string }): Promise<string> {
+    if (pr.headSha !== ship.head) throw new Error(`Refusing: workstream PR #${pr.number} is at ${pr.headSha.slice(0, 7) || "an unread head"}, not the Ship head ${ship.head.slice(0, 7)}; nothing was merged.`);
+    await drainBeforeAction(builder.parentThreadId, "merge");
+    const notMine = await ownerRefusal(builder, ship.caller, "merge");
+    if (notMine !== null) throw new Error(notMine);
+    const reach = await prReach(pr, ship.hostId);
+    const verification = requireVerification(pr, undefined, ship.caller, reach);
+    const checked = await requireChecker(pr, builder, reach);
+    await requireProductionApproval(pr, builder, ship.hostId);
+    // The workstream environment's PR is the workstream PR; without a registered environment GitHub answers.
+    let checks: { checksState: string; failed: number; pending: number; mergeable: string };
+    if (ship.environmentId) {
+      const held = await prepareEnvironmentPullRequest(ship.environmentId);
+      if (!held.available || prKeyOf(held.url) !== prKeyOf(pr.url)) throw new Error(`Refusing: the workstream environment holds ${held.url || "no PR"}, not ${pr.url}; nothing was merged.`);
+      checks = held;
+    } else {
+      await awaitMergeableKnown(ship.hostId, pr.url);
+      checks = await checkSummary(ship.hostId, pr.url);
+    }
+    const gate = mergeGate({ prState: "open", checksState: checks.checksState, failed: checks.failed, pending: checks.pending, mergeable: checks.mergeable });
+    if (!gate.ok) throw new Error(`Refusing: ${gate.reason}`);
+    const merged = await runStructuredOnHost(ship.hostId, `gh pr merge ${shQuote(pr.url)} --merge --match-head-commit ${shQuote(ship.head)}`, 180_000);
+    if (merged.exitCode !== 0) throw new Error(`Refusing: head-bound merge failed: ${merged.output}`);
+    verification.record();
+    await keepLanded(builder, "merged workstream PR", pr.url);
+    return `Merged ${mergedLine(pr)}${verification.note}${checked}`;
   }
 
   async function sanitizeDiagnosticSettings() {
@@ -7585,6 +7673,10 @@ export default async function plugin(bb: BbPluginApi) {
     reuseEnvironmentId?: string;
     /** A retry whose old worktree is gone starts a new worktree from the retained task branch. */
     baseBranch?: string;
+    /** A workstream task job saved as isolated: it gets its own BB-managed worktree. Every other
+     * workstream crew (scouts, checkers, release crews, and editors saved before task worktrees) runs in
+     * the workstream worktree. */
+    workstreamTask?: boolean;
     followUpOf?: string;
   }): Promise<Crew> {
     const task = input.task.trim().slice(0, MAX_TASK);
@@ -7733,7 +7825,7 @@ export default async function plugin(bb: BbPluginApi) {
     const capped = capPermission(input.permissionMode, await parentPermission(input.parentThreadId));
     let hostId: string | undefined;
     let environment: Parameters<typeof bb.sdk.threads.spawn>[0]["environment"];
-    const createdEditor = !!stream && !isAdoptedWorkstream(stream) && input.shape !== "scout" && input.role !== "checker" && input.role !== "lookup";
+    const createdEditor = !!stream && input.workstreamTask === true && !isAdoptedWorkstream(stream);
     if (input.reuseEnvironmentId) {
       hostId = selection.hostId;
       environment = { type: "reuse", environmentId: input.reuseEnvironmentId };
@@ -20276,9 +20368,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (crew !== undefined) inboundLedger.crewEnded(crew.id, Date.now());
   }
   bb.events.on("thread.archived", async ({ thread }) => {
-    // A workstream cleanup applies these itself once its archive is verified, and never after an undo.
-    if (workstreamArchiving.has(thread.id)) return;
-    await threadArchivedEffects(thread.id);
+    // During a workstream archive transaction the effects wait for its verdict; any event applies only
+    // while its thread is still archived (archivedEffectsIfCurrent).
+    if (archiveTransactions > 0) { deferredArchiveEvents.add(thread.id); return; }
+    await archivedEffectsIfCurrent(thread.id);
   });
   bb.events.on("thread.deleted", ({ thread }) => { launches.workerDeleted(thread.id); deliveries.ownerLost(thread.id); });
 

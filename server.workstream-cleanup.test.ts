@@ -194,3 +194,31 @@ test('an archive that BB widened to other threads, or one that work started besi
     } finally { await g.host.harness.lifecycle.dispose(); }
   } finally { await f.host.harness.lifecycle.dispose(); }
 });
+
+test('End archives the crew threads in the workstream worktree one by one under the same rules, then removes it', async () => {
+  for (const busy of [true, false]) {
+    const f = await foldedTask();
+    try {
+      const db = f.host.bb.storage.database();
+      const saved = db.prepare('SELECT id,record FROM firstmate_workstream').all()[0] as { id: string; record: string };
+      const w = JSON.parse(saved.record); w.jobs[0].cleanup = 'done';
+      db.prepare('UPDATE firstmate_workstream SET record=? WHERE id=?').run(JSON.stringify(w), saved.id);
+      f.tasks.move(f.task.id, 'cap', { to: 'dropped', reason: 'the owner ended this fixture task', ref: 'tg:42:1' }, Date.now());
+      await f.host.bb.storage.kv.set('crews', [{ id: 'scout1', task: 'read', projectId: 'cyndra', threadId: 'thr_scout', parentThreadId: 'cap', workstreamId: saved.id, nativeHome: '', worktree: false, shape: 'scout', posture: 'scout', createdAt: '2026-10-19T00:00:00.000Z', providerId: null, model: null, reasoningLevel: null }]);
+      f.threads.set('thr_scout', { status: 'idle', environmentId: 'env_ws', parentThreadId: 'cap', ...(busy ? { activity: { activeBackgroundAgentCount: 1 } } : {}) });
+      f.lists.occupants.set('env_ws', [{ id: 'thr_scout', status: 'idle', archivedAt: null }]);
+      const bulk: string[] = [];
+      f.host.harness.sdk.stub('environments.archiveThreads', async ({ environmentId }: { environmentId: string }) => { bulk.push(environmentId); return { archivedThreadIds: [] }; });
+      const end = f.host.harness.behavior.callRpc('workstreams.end', { threadId: 'cap', workstreamId: saved.id }) as Promise<{ workstream: { state: string } }>;
+      if (busy) {
+        await assert.rejects(end, /Workstream worktree kept: a crew thread is still working/);
+        assert.deepEqual(f.archived, []);
+      } else {
+        assert.equal((await end).workstream.state, 'ended');
+        assert.deepEqual(f.archived, ['thr_scout']);
+        assert.ok(f.commands.some((c) => c.includes('worktree remove') && c.includes('/repo/ws')));
+      }
+      assert.deepEqual(bulk, [], 'never an environment-wide archive');
+    } finally { await f.host.harness.lifecycle.dispose(); }
+  }
+});

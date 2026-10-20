@@ -151,6 +151,15 @@ export function parseFoldOutput(output: string): FoldOutput {
   return { ok, conflict, files, ...(head ? { head } : {}) };
 }
 
+/** foldInspectScript output: the head, whether it holds the task commit, and the files changed since `before`. */
+export function parseFoldInspect(output: string): { head: string; hasTarget: boolean; files: string[] } {
+  const head = foldValue(output, "HEAD");
+  if (!head) throw new Error("The fold check returned no head.");
+  const lines = output.split("\n").map((line) => line.trim()).filter(Boolean);
+  const marker = lines.indexOf("FOLD_FILES");
+  return { head, hasTarget: foldValue(output, "HAS_TARGET") === "yes", files: marker < 0 ? [] : lines.slice(marker + 1) };
+}
+
 /** One `FOLD_<NAME> <value>` line of a fold script, or undefined. */
 export function foldValue(output: string, name: string): string | undefined {
   const prefix = `FOLD_${name} `;

@@ -124,13 +124,17 @@ export function rollbackFoldScript(workstreamPath: string, before?: string, afte
   ].join("\n");
 }
 
-/** After a restart: the workstream head and whether it already holds the task commit. */
-export function foldInspectScript(workstreamPath: string, target: string): string {
+/**
+ * After a restart: the workstream head, whether it already holds the task commit, and, given the head
+ * saved before the fold, the files changed since then (lib/workstream-fold.ts parseFoldInspect).
+ */
+export function foldInspectScript(workstreamPath: string, target: string, before?: string): string {
   return [
     "set -eu",
     `cd -- ${shQuote(workstreamPath)}`,
     'echo "FOLD_HEAD $(git rev-parse HEAD)"',
     `if git merge-base --is-ancestor ${shQuote(target)} HEAD 2>/dev/null; then echo 'FOLD_HAS_TARGET yes'; else echo 'FOLD_HAS_TARGET no'; fi`,
+    ...(before ? ["echo FOLD_FILES", `git diff --name-only ${shQuote(before)} HEAD`] : []),
   ].join("\n");
 }
 
