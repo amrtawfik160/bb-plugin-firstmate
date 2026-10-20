@@ -60,7 +60,10 @@
     },
     {
       "name": "Cyndra",
-      "dev": { "repository": "cyndra-ai/cyndra-saas", "command": "bun install --frozen-lockfile && exec bun --env-file={source}/.env.local x vite --port {port} --strictPort --host 0.0.0.0" },
+      "dev": [
+        { "repository": "cyndra-ai/cyndra-saas", "command": "bun install --frozen-lockfile && exec bun --env-file={source}/.env.local x vite --port {port} --strictPort --host 0.0.0.0" },
+        { "repository": "amrtawfik160/reels-app", "command": "bun install --frozen-lockfile && PORT={port} REELS_NO_OPEN=1 exec node bin/reels-app.mjs" }
+      ],
       "repos": ["cyndra-ai/*"],
       "bbProjects": ["Cyndra", "Cyndra SaaS"],
       "proofSurface": "web",
