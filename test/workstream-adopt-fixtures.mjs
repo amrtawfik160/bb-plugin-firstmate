@@ -50,12 +50,13 @@ export function stubHostGit(host, { origin = 'https://github.com/cyndra-ai/cyndr
 
 /** Today's adopt: the card, then the owner's Approve. Returns the adopted workstream. */
 export async function approveAdopt(host, input) {
-  const first = await host.harness.behavior.callRpc('workstreams.adopt', { threadId: 'cap', ...input });
+  const threadId = input.threadId ?? 'cap';
+  const first = await host.harness.behavior.callRpc('workstreams.adopt', { ...input, threadId });
   if (first.workstream) return first;
   assert.ok(first.card, 'adopt shows the owner card first');
-  const resolved = await host.harness.behavior.callRpc('resolveAsk', { threadId: 'cap', id: first.card.askId, resolution: 'Approve' });
+  const resolved = await host.harness.behavior.callRpc('resolveAsk', { threadId, id: first.card.askId, resolution: 'Approve' });
   assert.equal(resolved.ok, true);
-  const listed = await host.harness.behavior.callRpc('workstreams.list', { threadId: 'cap' });
+  const listed = await host.harness.behavior.callRpc('workstreams.list', { threadId });
   const workstream = listed.workstreams.find((w) => w.requestId === input.requestId);
   assert.ok(workstream, `the approved card adopts ${input.name}`);
   return { workstream, card: first.card };

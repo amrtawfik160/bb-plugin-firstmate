@@ -2875,6 +2875,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   // The repository's PR base: its default branch on GitHub (staging for RunAnts), else main.
   async function repositoryBase(repository: string, source: { hostId: string; checkout: string } | null, hostId: string): Promise<string> {
+    if (!source && !hostId) return "main";
     try {
       const output = source ? await workstreamCommand(source, prBaseScript(source.checkout), 60_000)
         : await workstreamCommand({ hostId }, `git ls-remote --symref ${shQuote(`https://github.com/${repository}.git`)} HEAD`, 60_000);
@@ -2929,7 +2930,8 @@ export default async function plugin(bb: BbPluginApi) {
     const rule = projectForName(await projectLabel(req.projectId));
     const fallback = rule?.dev?.repository ?? rule?.repos.find((pattern) => !pattern.includes("*"));
     const crews = await readCrews();
-    const hostId = await resolveHostForProject(req.projectId, req.threadId);
+    // Only reads happen here; a crew's own environment names its host, so a captain without one still gets its card.
+    const hostId = await resolveHostForProject(req.projectId, req.threadId).catch(() => "");
     const sources: Array<AdoptSource & { title?: string }> = [];
     const repositories: string[] = [];
     const origins = new Map<string, string>();
@@ -3055,7 +3057,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Everything is read before the card, so a refusal comes before the owner sees anything.
     const plan = await adoptSources(req);
-    const hostId = await resolveHostForProject(req.projectId, req.threadId);
+    const hostId = await resolveHostForProject(req.projectId, req.threadId).catch(() => "");
     const first = plan.repositories[0]!;
     const base = await repositoryBase(first, await repositorySource(first, req.projectId, hostId, false), hostId);
     const text = adoptCardText({ name: req.name, base, sources: plan.sources, tasks: taskIds.map((id) => ({ id, title: ownerTasks.get(id)?.title ?? id })), replaces: req.replacesPrs });

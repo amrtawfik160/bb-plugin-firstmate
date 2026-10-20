@@ -9,6 +9,7 @@ import { createInboundLedger } from "./lib/inbound-ledger.ts";
 import { createOwnerTasks } from "./lib/owner-tasks.ts";
 import { manifestSkillIds } from "./scripts/plugin-skill-fixture.mjs";
 import { stubProviderCatalog } from "./test/provider-catalog.mjs";
+import { approveAdopt, stubHostGit } from "./test/workstream-adopt-fixtures.mjs";
 
 /**
  * Firstmate and the Telegram connector together: the connector's real Engine, with its fake Telegram,
@@ -133,9 +134,10 @@ test("joint: adopt three Cyndra-shaped workstreams of two tasks (one running cre
         : { id: environmentId, hostId: "h1", path: "/repo/main", status: "ready", isWorktree: false };
     });
     host.harness.sdk.stub("threadSections.list", async () => []);
-    host.harness.sdk.stub("environments.list", async () => []);
+    host.harness.sdk.stub("environments.list", async () => [{ id: "env_main", hostId: "h1", path: "/repo/main", status: "ready", isWorktree: false }]);
     host.harness.sdk.stub("projects.list", async () => [{ id: "proj_cyndra", name: "Cyndra SaaS" }, { id: "proj_safi", name: "Safi" }]);
-    host.harness.sdk.stub("projects.get", async ({ projectId }: { projectId: string }) => ({ id: projectId, name: projectId === "proj_safi" ? "Safi" : "Cyndra SaaS", kind: "repo" }));
+    host.harness.sdk.stub("projects.get", async ({ projectId }: { projectId: string }) => ({ id: projectId, name: projectId === "proj_safi" ? "Safi" : "Cyndra SaaS", kind: "repo", sources: projectId === "proj_cyndra" ? [{ hostId: "h1", path: "/repo/main", isDefault: true }] : [] }));
+    stubHostGit(host);
     host.harness.sdk.stub("threads.send", async () => ({}));
     const { store } = openStore();
     const config = baseConfig({
@@ -222,14 +224,16 @@ test("joint: adopt three Cyndra-shaped workstreams of two tasks (one running cre
       { name: "Dr Woo Apple redesign", requestId: "adopt-apple", ids: [opened[2]!.id, opened[3]!.id] },
       { name: "Coss UI design system", requestId: "adopt-coss", ids: [opened[4]!.id, opened[5]!.id] },
     ];
+    // Adopt shows the owner one card per workstream; his Approve adopts it with a new workstream branch.
     const adopted = [];
     for (const group of groups) {
-      adopted.push(await host.harness.behavior.callRpc("workstreams.adopt", {
+      adopted.push(await approveAdopt(host, {
         threadId: "thr_cap", projectId: "proj_cyndra", name: group.name, requestId: group.requestId, taskIds: group.ids,
-      }) as { workstream: { id: string; repos: unknown[] } });
+      }) as { workstream: { id: string; repos: Array<{ path: string; existing?: boolean }>; jobs: Array<{ id: string; state: string; adopted?: boolean }> } });
     }
-    assert.equal(adopted[0]!.workstream.repos.length, 2);
-    assert.equal((adopted[0]!.workstream.repos[0] as { path?: string }).path, "/wt/chat");
+    assert.deepEqual(adopted[0]!.workstream.repos.map((repo) => repo.existing), [undefined]);
+    assert.deepEqual(adopted[0]!.workstream.jobs.map((job) => [job.id, job.adopted]), [["crew-chat", true], ["crew-tokens", true]]);
+    assert.equal(adopted[0]!.workstream.jobs[0]!.state, "running", "the running crew folds when it finishes");
     const crew = ((await host.bb.storage.kv.get("crews")) as Array<{ id: string; workstreamId?: string }>).find((row) => row.id === "crew-chat");
     assert.equal(crew?.workstreamId, undefined);
     tg.engine.refreshBoardSoon();
