@@ -394,9 +394,10 @@ export function createOwnerGate(db: Database) {
     needStatusPost(pr: string, head: string, error: string, at: number): void {
       db.prepare("INSERT INTO production_status_retry(pr, head, last_error, at) VALUES(?,?,?,?) ON CONFLICT(pr, head) DO UPDATE SET last_error=excluded.last_error, at=excluded.at").run(pr.toLowerCase(), head, error, at);
     },
-    /** Save a post held back by the background allowance; a saved post keeps its last error and place. */
-    deferStatusPost(pr: string, head: string, at: number): void {
-      db.prepare("INSERT INTO production_status_retry(pr, head, last_error, at) VALUES(?,?,?,?) ON CONFLICT(pr, head) DO NOTHING").run(pr.toLowerCase(), head, "deferred: background GitHub allowance used", at);
+    /** Save a post for a later background send, with no error: a new head's first post, or one the
+     * allowance held back. A post already saved keeps its last error and place. */
+    queueStatusPost(pr: string, head: string, at: number): void {
+      db.prepare("INSERT INTO production_status_retry(pr, head, last_error, at) VALUES(?,?,?,?) ON CONFLICT(pr, head) DO NOTHING").run(pr.toLowerCase(), head, "", at);
     },
     clearStatusPost(pr: string, head: string): void {
       db.prepare("DELETE FROM production_status_retry WHERE pr=? AND head=?").run(pr.toLowerCase(), head);

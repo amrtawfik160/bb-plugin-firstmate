@@ -27,10 +27,9 @@ function forge(command, statusOk) {
   return { code: 0 };
 }
 
-async function completedWithSavedRetry() {
-  const host = createFakePluginHost({ pluginId: 'firstmate', agentSkillIds: ['firstmate', 'captain'], settings: { fmHome: '/native', fmHostId: 'host_1' } });
-  await host.bb.storage.kv.set('captain-project:thr_cap', 'proj_1');
-  await plugin(host.bb);
+// The fake host's BB and GitHub answers; a reloaded host needs them again. metered: GitHub answers
+// carry GraphQL rate-limit headers, so the background pass reads due PRs.
+function stubHost(host, commands, statusOk, taps, metered = false) {
   host.harness.sdk.stub('threads.list', async () => []);
   host.harness.sdk.stub('threads.getPluginMetadata', async ({ threadId }) => threadId === 'thr_cap' ? { captain: 'true' } : {});
   host.harness.sdk.stub('threads.get', async ({ threadId }) => makeThreadResponse({ id: threadId, projectId: 'proj_1', status: 'idle', environmentId: `env_${threadId}` }));
@@ -43,21 +42,29 @@ async function completedWithSavedRetry() {
   host.harness.sdk.stub('threads.send', async () => ({ delivery: 'queued' }));
   host.harness.sdk.stub('projects.get', async () => ({ id: 'proj_1', name: 'woo-app', kind: 'repo' }));
   host.harness.sdk.stub('files.read', async () => { throw new Error('ENOENT'); });
-  const taps = new Map();
   host.harness.sdk.stub('plugins.callRpc', async (call) => call.method === 'ownerAnswer' ? { answer: taps.get(call.input.askId) ?? null } : { ok: true, queued: 1, duplicate: false });
-  let statusOk = false;
-  const commands = [];
   const byId = new Map();
   host.harness.sdk.stub('terminals.create', async ({ start }) => { const id = `t${commands.length}`; byId.set(id, start.command); commands.push(start.command); return { id }; });
   host.harness.sdk.stub('terminals.get', async () => ({ status: 'running' }));
   host.harness.sdk.stub('terminals.close', async () => ({}));
   host.harness.sdk.stub('terminals.output', async ({ terminalId }) => {
     const command = byId.get(terminalId);
-    const out = forge(command, () => statusOk);
+    const out = forge(command, statusOk);
     const captured = command.includes('FM_HOST_CAPTURE_V1');
-    const payload = captured ? JSON.stringify({ protocol: 'FM_HOST_CAPTURE_V1', exitCode: out.code ?? 0, stdout: out.payload ?? '', stderr: '' }) : out.payload ?? '';
+    const stderr = metered ? `< X-Ratelimit-Remaining: 5000\n< X-Ratelimit-Reset: ${Math.floor(Date.now() / 1000) + 7200}\n< X-Ratelimit-Resource: graphql\n` : '';
+    const payload = captured ? JSON.stringify({ protocol: 'FM_HOST_CAPTURE_V1', exitCode: out.code ?? 0, stdout: out.payload ?? '', stderr }) : out.payload ?? '';
     return { nextSeq: 1, chunks: [{ dataBase64: Buffer.from(`${payload}\n__FM_HOST_RC:${captured ? 0 : out.code ?? 0}\n`).toString('base64') }] };
   });
+}
+
+async function completedWithSavedRetry() {
+  const host = createFakePluginHost({ pluginId: 'firstmate', agentSkillIds: ['firstmate', 'captain'], settings: { fmHome: '/native', fmHostId: 'host_1' } });
+  await host.bb.storage.kv.set('captain-project:thr_cap', 'proj_1');
+  await plugin(host.bb);
+  const taps = new Map();
+  let statusOk = false;
+  const commands = [];
+  stubHost(host, commands, () => statusOk, taps);
   await host.bb.storage.kv.set('crews', [CREW]);
   const db = host.bb.storage.database();
   const store = createDeliveries(db);
@@ -78,7 +85,7 @@ async function completedWithSavedRetry() {
   assert.equal(store.get(ID).status, 'complete');
   assert.equal(gate.statusPostNeeded(ID, HEAD), true);
   commands.length = 0;
-  return { host, store, gate, commands, deliveries, recover: () => { statusOk = true; } };
+  return { host, store, gate, commands, deliveries, taps, statusOk: () => statusOk, recover: () => { statusOk = true; } };
 }
 
 const posts = (commands) => commands.filter((c) => c.includes(`/statuses/${HEAD}`));
@@ -223,4 +230,42 @@ test('a background approval read the allowance refuses defers the whole status s
     assert.deepEqual(retryRows(c), []);
     assert.equal(posts(c.commands).length, 21, 'each saved post is sent once');
   } finally { Date.now = realNow; await c.host.harness.lifecycle.dispose(); }
+});
+
+test('a new head\'s first status post waits for the end of the pass and the allowance, saved without an error across a restart', async () => {
+  const c = await completedWithSavedRetry();
+  const realNow = Date.now;
+  let host = c.host;
+  const rows = () => retryRows({ host });
+  try {
+    let simulated = realNow() + 3_600_000;
+    Date.now = () => simulated;
+    c.gate.clearStatusPost(ID, HEAD);
+    stubHost(host, c.commands, c.statusOk, c.taps, true);
+    for (let n = 131; n <= 142; n++) c.store.register({ url: `https://github.com/${REPO}/pull/${n}`, taskId: 'woo1', projectId: 'proj_1', owner: 'thr_cap', home: '/native', worker: 'thr_woo', requirement: 'pr', title: `Change ${n}` });
+    const reads = () => c.commands.filter((cmd) => cmd.includes('gh pr view'));
+    c.recover();
+    await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+    // The burst of 10 goes to the quota probe and the PR reads; their first posts wait, saved with no error.
+    const first = reads().length;
+    assert.ok(first >= 8 && first < 12, `${first} PR reads in the first pass`);
+    assert.deepEqual(posts(c.commands), []);
+    assert.equal(rows().length, first);
+    assert.ok(rows().every((row) => row.last_error === ''), JSON.stringify(rows()));
+    host = await host.harness.lifecycle.reload(plugin);
+    stubHost(host, c.commands, c.statusOk, c.taps, true);
+    assert.equal(rows().length, first, 'the saved first posts survive the restart');
+    c.commands.length = 0;
+    simulated += 60_000;
+    await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+    assert.equal(reads().length, 12 - first, 'the PRs not read yet come first');
+    const firstPost = c.commands.findIndex((cmd) => cmd.includes('/statuses/'));
+    assert.ok(firstPost > c.commands.findLastIndex((cmd) => cmd.includes('gh pr view')), 'status posts go after the PR reads');
+    for (let pass = 0; pass < 10 && rows().length > 0; pass++) {
+      simulated += 60_000;
+      await host.harness.behavior.runSchedule('pr-delivery-follow-up');
+    }
+    assert.deepEqual(rows(), []);
+    assert.equal(posts(c.commands).length, 12, 'each first post is sent once');
+  } finally { Date.now = realNow; await host.harness.lifecycle.dispose(); }
 });

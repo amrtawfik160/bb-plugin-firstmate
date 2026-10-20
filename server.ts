@@ -8840,8 +8840,10 @@ export default async function plugin(bb: BbPluginApi) {
         else bb.log.warn(`same-tree owner tap ${observed.id}: ${applied.reason}`);
       }
       if (observed.headSha && (observed.headSha !== previousHead || ownerGate.statusPostNeeded(observed.id, observed.headSha))) {
-        const task = taskForPr(observed.id, observed.owner, observed.taskId);
-        await syncOwnerApprovalStatus(observed.id, observed.headSha, hostId || null, task);
+        // A background pass saves the post for its end-of-pass drain, so PR reads come first.
+        // An explicit reconcile posts at once.
+        if (backgroundBudget.getStore() !== undefined) ownerGate.queueStatusPost(observed.id, observed.headSha, Date.now());
+        else await syncOwnerApprovalStatus(observed.id, observed.headSha, hostId || null, taskForPr(observed.id, observed.owner, observed.taskId));
       }
       // Without a manager nobody acts on minute-by-minute health; look less often until it merges or closes.
       if (observed.ownerNeeded && !["complete","explicitly-abandoned","merged-unverified"].includes(observed.status)) return deliveries.save({...observed,nextCheckAt:Date.now()+LOST_OWNER_RECHECK_MS});
@@ -9627,14 +9629,15 @@ export default async function plugin(bb: BbPluginApi) {
         await follow(record);
       }
     }));
-    // The due list skips completed and abandoned deliveries; their saved owner approval
-    // status posts are read on their own, so those deliveries are not polled again.
-    const statusRetries = ownerGate.pendingStatusPosts()
-      .filter(({ pr }) => ["complete","explicitly-abandoned"].includes(deliveries.get(pr)?.status ?? ""))
-      .slice(0, FOLLOW_UP_DUE_LIMIT);
-    for (const { pr, head } of statusRetries) {
+    // Saved owner approval status posts go after the PR reads, from what the allowance has left:
+    // a new head's first post and every retry, for active, completed and abandoned deliveries.
+    // They are read on their own, so finished deliveries are not polled again. A post for a head
+    // the PR no longer has is dropped.
+    for (const { pr, head } of ownerGate.pendingStatusPosts().slice(0, FOLLOW_UP_DUE_LIMIT)) {
       signal?.throwIfAborted();
       if (backgroundAllowance() <= 0) break;
+      const current = deliveries.get(pr)?.headSha;
+      if (current && current !== head) { ownerGate.clearStatusPost(pr, head); continue; }
       await boundedFollowUp(() => serializeLedger(`delivery:${pr}`, () => retryOwnerApprovalStatus(pr, head)), signal)
         .catch(error => bb.log.warn(`Owner approval status retry ${pr}: ${String(error)}`));
     }
@@ -11056,11 +11059,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function syncOwnerApprovalStatus(pr: string, head: string, hostId: string | null, task?: OwnerTask | null): Promise<void> {
     if (!pr || !head) return;
-    // A background pass pays every approval read from the shared GitHub allowance, and the post
-    // too when it retries a saved one. A refused request defers the whole sync: the saved post
-    // keeps its last error, and no failure is recorded. Explicit requests are not charged.
-    const retry = backgroundBudget.getStore() !== undefined && ownerGate.statusPostNeeded(pr, head);
-    const defer = () => ownerGate.deferStatusPost(pr, head, Date.now());
+    // A background pass pays every approval read and the post from the shared GitHub allowance.
+    // A refused request defers the whole sync: the post stays saved with its last error, and no
+    // failure is recorded. Explicit requests are not charged.
+    const defer = () => ownerGate.queueStatusPost(pr, head, Date.now());
     const found = task ?? taskForPr(pr);
     const cards = ownerGate.cardsForPr(pr);
     let coverage: Awaited<ReturnType<typeof cardCoverage>>;
@@ -11088,7 +11090,7 @@ export default async function plugin(bb: BbPluginApi) {
         fail("no host");
         return;
       }
-      if (retry && !reserveGithub(postedHost, false, 1, true)) {
+      if (!reserveGithub(postedHost, false, 1, true)) {
         defer();
         return;
       }
@@ -11100,7 +11102,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  // A completed or abandoned delivery is no longer polled; its saved status post retries here.
+  // A saved status post, sent from the background drain or an explicit reconcile of a finished delivery.
   async function retryOwnerApprovalStatus(pr: string, head: string): Promise<void> {
     const record = deliveries.get(pr);
     const task = taskForPr(pr, record?.owner, record?.taskId);
