@@ -167,6 +167,30 @@ test("quota reads the live bb subs shape: active account, model-group rows, usd 
   assert.match(fiveHour.line, /claude-code claude-opus-5-5: 6% left in 5-hour window/, "a 5-hour reading is never called weekly");
 });
 
+test("a spent short window blocks a model whose weekly quota remains, and names that window", async () => {
+  const spent = quota([{ provider: "claude", extra: [
+    { label: "5-hour window", remaining: 0, limit: 100, unit: "percent", scope: null },
+    { label: "Weekly window", remaining: 80, limit: 100, unit: "percent", scope: null },
+  ] }, { provider: "codex", weekly: 80 }]);
+  assert.deepEqual(quotaLeft(spent, "claude-code", "claude-opus-5-5"), { percent: 0, window: "5-hour window" });
+  assert.equal(weeklyPercent(spent, "claude-code", "claude-opus-5-5"), undefined, "a spent 5-hour window is not reported as weekly");
+  const { config } = loadCrewDispatch("");
+  const pick = await chooseProfile({ config, quota: spent, fallback: async () => [{ harness: "codex", model: "gpt-6.1-sol" }] });
+  assert.equal(pick.line, "Picked codex gpt-6.1-sol (fallback to a usable provider; the default cannot run: claude-code claude-opus-5-5: none left in 5-hour window).");
+});
+
+test("an unknown provider default is a blocked candidate, and a checker never runs on one", async () => {
+  const { config } = loadCrewDispatch("");
+  const rules = { ...config, rules: [{ id: "checker", when: "checker", use: [{ harness: "claude-code" as const }, { harness: "codex" as const, model: "gpt-6.1-sol" }] }] };
+  const pick = await chooseProfile({ config: rules, role: "checker", avoidModel: "claude-opus-5-5", resolveModel: async () => undefined });
+  assert.deepEqual([pick.providerId, pick.model], ["codex", "gpt-6.1-sol"]);
+  assert.equal(pick.line, "Picked codex gpt-6.1-sol (rule checker; skipped claude-code: default model unknown (model list unreadable)).");
+  const noResolver = await chooseProfile({ config: rules, role: "checker", avoidModel: "claude-opus-5-5" });
+  assert.equal(noResolver.model, "gpt-6.1-sol", "without a resolver a checker still skips an unknown default");
+  const resolved = await chooseProfile({ config: rules, role: "checker", avoidModel: "gpt-6.1-sol", resolveModel: async () => "claude-opus-5-5" });
+  assert.equal(resolved.line, "Picked claude-code claude-opus-5-5 (rule checker).", "the line names the resolved model");
+});
+
 test("all-low notice: every model low keeps the strongest that can run and tells the owner", async () => {
   const { config } = loadCrewDispatch("");
   const pick = await chooseProfile({ config, rule: "ui", quota: quota([{ provider: "grok", weekly: 5 }, { provider: "antigravity", weekly: 3 }, { provider: "claude", weekly: 10 }]) });
@@ -328,8 +352,10 @@ test("readBbSubsQuota: no live call under FM_NO_LIVE_NETWORK, 5-minute cache, 1-
   assert.equal(await readBbSubsQuota(io(2 + 5 * 60_000 + 30_000, JSON.stringify(LIVE_SHAPE))), null, "a failure is kept for a minute");
   assert.equal(weeklyPercent(await readBbSubsQuota(io(2 + 6 * 60_000, JSON.stringify(LIVE_SHAPE))), "codex"), 37, "then read again");
   assert.equal(calls.length, 3);
+  assert.equal(await readBbSubsQuota({ ...io(2 + 6 * 60_000 + 1, '{"accounts":[]}'), env: { BB_CLI: "/opt/other-bb" } }).then((v) => v?.accounts.length), 0, "another command does not reuse this reading");
+  assert.equal(calls.length, 4);
   cache.current = null;
   const [a, b] = await Promise.all([readBbSubsQuota(io(10_000_000, JSON.stringify(LIVE_SHAPE))), readBbSubsQuota(io(10_000_000, JSON.stringify(LIVE_SHAPE)))]);
   assert.equal(a, b, "two dispatches at once share one read");
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 5);
 });

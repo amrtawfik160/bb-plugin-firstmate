@@ -1,5 +1,5 @@
-// Check round 1 on PR #181 (head 7f4e1d2b): the reviewer's probes, kept as tests. Each one failed
-// before the fix; its assertions state the safe outcome.
+// Check rounds 1 and 2 on PR #181 (heads 7f4e1d2b and 388ff8fd): the reviewer's probes, kept as tests.
+// Each defect probe failed before its fix; its assertions state the safe outcome.
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -159,4 +159,67 @@ test("probe: a slow quota command returns unknown within its timeout", async () 
   const start=Date.now();const out=await readBbSubsQuota({env:{BB_CLI:bin},cache:{current:null}});const elapsed=Date.now()-start;
   console.log("SLOW-QUOTA",JSON.stringify({elapsedMs:elapsed,out}));assert.equal(out,null);assert.ok(elapsed<35000);
  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+// Check round 2 (head 388ff8fd).
+test("round2: an unreadable provider default cannot bypass checker exclusion", async () => {
+ const dir=mkdtempSync(join(tmpdir(),"a181-r2-default-"));const host=await dispatchHost({fmHome:dir});
+ try {
+  host.harness.sdk.stub("projects.defaultExecutionOptions",async()=>({providerId:"claude-code",model:"claude-opus-5-5"}));
+  await dispatch(host,{task:"fix tax rounding",taskId:"builder",providerId:"claude-code",model:"claude-opus-5-5",sharedEnv:true},capCtx);
+  await tool(host,"firstmate_models").execute({action:"set",id:"checker",when:"checker",use:[{harness:"claude-code"},{harness:"codex",model:"gpt-6.1-sol"}]},capCtx);
+  host.harness.sdk.stub("providers.models",async({providerId}: {providerId?:string}={})=>providerId==="claude-code"?{models:[],modelLoadError:"temporarily unable to load models"}:{modelLoadError:null,models:(PROVIDER_CATALOG[providerId??"claude-code"]??[]).map((id,i)=>({id,model:id,isDefault:i===0}))});
+  const out=await dispatch(host,{task:"check tax rounding PR",role:"checker",shape:"scout",taskRef:"T1",sharedEnv:true},capCtx);
+  console.log("UNRESOLVED-CHECKER",JSON.stringify({out,spawned:spawned(host)}));
+  assert.equal(spawned(host).length,2);assert.equal(spawned(host).at(-1)?.providerId,"codex");assert.equal(spawned(host).at(-1)?.model,"gpt-6.1-sol");
+ } finally {await host.harness.lifecycle.dispose();rmSync(dir,{recursive:true,force:true});}
+});
+
+test("round2: a model-only named crew remains protected from subsequent automatic failover",async()=>{
+ const host=await dispatchHost();
+ try {
+  await dispatch(host,{task:"inspect tax rounding",taskId:"named",model:"claude-opus-5-5",shape:"scout"},capCtx);
+  const crews=await host.bb.storage.kv.get("crews");assert.equal(crews[0].providerNamed,true);
+  host.harness.sdk.stub("threads.get",async({threadId}: {threadId:string})=>makeThreadResponse({id:threadId,status:"idle",projectId:"proj_1",providerId:"claude-code"}));
+  host.harness.sdk.stub("threads.events.list",async()=>[]);
+  const event=await host.harness.behavior.emitThreadEvent("thread.idle",{thread:makeThreadResponse({id:"thr_new1",status:"idle",projectId:"proj_1"}),lastAssistantText:"Upgrade your plan to continue."});
+  assert.deepEqual(event.errors,[]);assert.equal(spawned(host).length,1);
+  console.log("NAMED-PROTECTED",JSON.stringify({providerNamed:crews[0].providerNamed,spawned:spawned(host)}));
+ }finally{await host.harness.lifecycle.dispose();}
+});
+
+test("round2: a background pick and Tell the owner notice reach the captain once",async()=>{
+ const dir=mkdtempSync(join(tmpdir(),"a181-r2-async-"));mkdirSync(join(dir,"config"));writeFileSync(join(dir,"config","fm-model-rules.json"),"{oops");
+ const host=await dispatchHost({fmHome:dir,async:true});
+ try{
+  const out=await dispatch(host,{task:"fix a tax label",taskId:"async-notice",rule:"small-edit",shape:"scout",sharedEnv:true},capCtx);
+  for(let n=0;n<150;n++){if((await host.bb.storage.kv.get("crews"))?.length)break;await new Promise(resolve=>setTimeout(resolve,20));}
+  await host.harness.lifecycle.dispose();
+  const messages=host.harness.sdk.callsTo("threads.send").map(([a])=>JSON.stringify(a));const picked=messages.filter(m=>m.includes("Picked "));
+  console.log("ASYNC-NOTICE",JSON.stringify({out,messages}));assert.equal(picked.length,1);assert.match(picked[0],/Tell the owner: config/);assert.match(picked[0],/is broken/);
+ }finally{await host.harness.lifecycle.dispose();rmSync(dir,{recursive:true,force:true});}
+});
+
+test("round2: zero five-hour quota blocks a default whose weekly quota remains",async()=>{
+ const dir=mkdtempSync(join(tmpdir(),"a181-r2-short-window-"));const oldFlag=process.env.FM_NO_LIVE_NETWORK,oldBin=process.env.BB_CLI;let host;
+ try{
+  const bin=join(dir,"quota-cli");writeFileSync(bin,'#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({accounts:[{provider:"claude",active:true,limits:[{label:"5-hour window",remaining:0,limit:100,unit:"percent"},{label:"Weekly window",remaining:80,limit:100,unit:"percent"}]},{provider:"codex",active:true,limits:[{label:"Weekly window",remaining:80,limit:100,unit:"percent"}]}]}));\n');chmodSync(bin,0o700);
+  process.env.FM_NO_LIVE_NETWORK="0";process.env.BB_CLI=bin;host=await dispatchHost();
+  const out=await dispatch(host,{task:"fix tax rounding",shape:"scout"});
+  console.log("ZERO-SHORT-WINDOW",JSON.stringify({out,spawned:spawned(host)}));assert.equal(spawned(host).at(-1)?.providerId,"codex");
+ }finally{
+  if(host)await host.harness.lifecycle.dispose();
+  if(oldFlag===undefined)delete process.env.FM_NO_LIVE_NETWORK;else process.env.FM_NO_LIVE_NETWORK=oldFlag;
+  if(oldBin===undefined)delete process.env.BB_CLI;else process.env.BB_CLI=oldBin;
+  rmSync(dir,{recursive:true,force:true});
+ }
+});
+
+test("round2: no usable provider refuses without spawning",async()=>{
+ const host=await dispatchHost();
+ try{
+  host.harness.sdk.stub("providers.list",async()=>Object.keys(PROVIDER_CATALOG).map(id=>({id,available:false,reasoningLevels:[{id:"high"}]})));
+  const out=await dispatch(host,{task:"research invoice standards",rule:"research",shape:"scout"});
+  console.log("NO-USABLE",JSON.stringify({out,spawned:spawned(host)}));assert.match(out,/Refusing:/);assert.equal(spawned(host).length,0);
+ }finally{await host.harness.lifecycle.dispose();}
 });

@@ -7210,8 +7210,9 @@ export default async function plugin(bb: BbPluginApi) {
         resolveModel: (profile) => catalogDefaultModel(profile.harness, routing),
         fallback: () => usableProviderProfiles({ projectId: owned.projectId, parentThreadId: owned.parentThreadId, shape: owned.shape }, routing),
       });
-      // The final concrete model is checked once more: a checker never runs its builder's model.
+      // The final concrete model is checked once more: a checker never runs its builder's model or an unknown one.
       if (avoidModel !== undefined && pick.model === avoidModel) throw new Error(`Refusing: the checker would run its builder's model ${avoidModel}. Name another model. Nothing was spawned.`);
+      if (input.role === "checker" && pick.model === undefined) throw new Error(`Refusing: the checker's model on ${pick.providerId} is unknown. Name a model. Nothing was spawned.`);
       pickedByDispatch = true;
       const moved = pick.failed !== undefined && pick.failed.length > 0
         ? [...limited].filter((id) => id !== pick.providerId).map((id) => `Note: ${id} is ${marks[id]!.reason} until ${utcMinute(marks[id]!.until)}; this crew runs on ${pick.providerId}.`)
@@ -18660,8 +18661,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function catalogDefaultModel(providerId: string, routing: HostRouting): Promise<string | undefined> {
     if (providerId === "codex") return CODEX_MODEL;
     try {
-      const models = asRecord(await raceAbort(bb.sdk.providers.models({ ...routing, providerId }), undefined, STUCK_HOST_CALL_MS))["models"];
-      const entries = Array.isArray(models) ? models.map(asRecord) : [];
+      const catalog = asRecord(await raceAbort(bb.sdk.providers.models({ ...routing, providerId }), undefined, STUCK_HOST_CALL_MS));
+      if (catalog["modelLoadError"] != null) return undefined;
+      const entries = Array.isArray(catalog["models"]) ? (catalog["models"] as unknown[]).map(asRecord) : [];
       const pick = entries.find((m) => m["isDefault"] === true) ?? entries[0];
       const id = pick?.["model"] ?? pick?.["id"];
       return typeof id === "string" && id !== "" ? id : undefined;

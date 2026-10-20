@@ -131,7 +131,7 @@ export type QuotaLimit = {
 };
 export type QuotaAccount = { provider: string; account?: string; active?: boolean; stale?: boolean; error?: unknown; limits: QuotaLimit[] };
 export type QuotaSnapshot = { accounts: QuotaAccount[] };
-export type QuotaCache = { at: number; value: QuotaSnapshot | null; ttl: number };
+export type QuotaCache = { at: number; value: QuotaSnapshot | null; ttl: number; bin?: string };
 export type QuotaIo = {
   execFile?: (cmd: string, args: string[], opts: { timeout: number; maxBuffer: number; encoding: "utf8" }) => Promise<{ stdout: string }>;
   env?: NodeJS.Dict<string | undefined>;
@@ -313,9 +313,12 @@ function rowApplies(limit: QuotaLimit, model: string | undefined): boolean {
 
 export type QuotaLeft = { percent: number; window: string };
 
-// The weekly rows decide; with no weekly row, the tightest other window stands in under its own label.
+// Any applicable window at zero (a spent 5-hour window too) blocks the account. Otherwise the weekly rows
+// decide; with no weekly row, the tightest other window stands in under its own label.
 function accountLeft(account: QuotaAccount, model: string | undefined): QuotaLeft | undefined {
   const rows = account.limits.filter((row) => rowApplies(row, model));
+  const spent = rows.find((row) => { const percent = percentOf(row); return percent !== undefined && percent <= 0; });
+  if (spent !== undefined) return { percent: 0, window: spent.label?.trim() || "quota" };
   const weekly = rows.filter((row) => /week/i.test(row.label ?? ""));
   let tightest: QuotaLeft | undefined;
   for (const row of weekly.length > 0 ? weekly : rows) {
@@ -378,6 +381,8 @@ async function pickFromProfiles(listed: DispatchProfile[], input: ListInput): Pr
     if (input.seen.has(key)) continue;
     input.seen.add(key);
     candidates += 1;
+    // An unreadable or empty model list leaves the default unknown: never spawn on it, and never a checker.
+    if (model === undefined && (input.resolveModel !== undefined || input.avoidModel !== undefined)) { skip(profile, "default model unknown (model list unreadable)"); continue; }
     if (input.avoidModel !== undefined && profile.model === input.avoidModel) { skip(profile, "the builder's model"); continue; }
     const refusal = modelPermissionRefusal(profile.model, input.modelPermission);
     if (profile.model !== undefined && PERMISSION_MODELS.has(profile.model) && refusal !== null) { permissionRefusals.push(refusal); skip(profile, "needs the owner's permission"); continue; }
@@ -624,15 +629,16 @@ export async function readBbSubsQuota(io: QuotaIo = {}): Promise<QuotaSnapshot |
   if (env.FM_NO_LIVE_NETWORK === "1") return null;
   const now = io.now ?? Date.now();
   const cache = io.cache ?? defaultQuotaCache;
-  if (cache.current !== null && now - cache.current.at < cache.current.ttl) return cache.current.value;
+  const bin = env.BB_CLI?.trim() || "bb";
+  // A reading counts only for the command that produced it.
+  if (cache.current !== null && (cache.current.bin ?? bin) === bin && now - cache.current.at < cache.current.ttl) return cache.current.value;
   if (cache.pending) return cache.pending;
   const run = io.execFile ?? ((cmd, args, opts) => execFile(cmd, args, opts));
-  const bin = env.BB_CLI?.trim() || "bb";
   const read = (async () => {
     let value: QuotaSnapshot | null = null;
     try { value = parseQuota((await run(bin, ["subs", "quota", "--json"], { timeout: 30_000, maxBuffer: 10 * 1024 * 1024, encoding: "utf8" })).stdout); }
     catch { value = null; }
-    cache.current = { at: now, value, ttl: value === null ? QUOTA_RETRY_MS : QUOTA_FRESH_MS };
+    cache.current = { at: now, value, ttl: value === null ? QUOTA_RETRY_MS : QUOTA_FRESH_MS, bin };
     return value;
   })();
   cache.pending = read;
