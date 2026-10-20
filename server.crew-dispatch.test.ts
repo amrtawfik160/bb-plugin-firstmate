@@ -6,6 +6,7 @@ import test from "node:test";
 import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import plugin from "./server.ts";
 import { PROVIDER_CATALOG, stubProviderCatalog } from "./test/provider-catalog.mjs";
+import { PROVIDER_UNAVAILABLE_KEY } from "./lib/provider-failover.ts";
 
 type Host = ReturnType<typeof createFakePluginHost>;
 
@@ -80,6 +81,16 @@ test("every pick goes through the catalog: a missing model is skipped, antigravi
     const refused = await dispatch(host, { task: "what changed in the API this week", rule: "research" });
     assert.match(refused, /no model in rule research can run \(acp-grok grok-4\.7: provider not available\)\. Name a model or pick another rule\. Nothing was spawned\./);
     assert.equal(spawned(host).length, before, "nothing was spawned");
+  } finally { await host.harness.lifecycle.dispose(); }
+});
+
+test("a rule's model at its plan limit gives way to the rule's next model, not to another provider", async () => {
+  const host = await dispatchHost({ catalog: WITH_GROK_45 });
+  try {
+    await host.bb.storage.kv.set(PROVIDER_UNAVAILABLE_KEY, { "acp-grok": { until: Date.now() + 30 * 60_000, reason: "at its plan limit" } });
+    const out = await dispatch(host, { task: "restyle the login form", rule: "ui", shape: "scout" });
+    assert.match(out, /\nPicked acp-antigravity gemini-3\.8-flash \(rule ui; skipped acp-grok grok-4\.5 high: at its plan limit until .+ UTC\)\./);
+    assert.deepEqual(spawned(host).at(-1), { providerId: "acp-antigravity", model: "gemini-3.8-flash", reasoningLevel: undefined });
   } finally { await host.harness.lifecycle.dispose(); }
 });
 

@@ -7156,6 +7156,7 @@ export default async function plugin(bb: BbPluginApi) {
     // home's config/crew-dispatch.json, else that file's role default; quota and the catalog skip candidates.
     const ownerNamed = input.providerNamed === true || input.ownerRequestedProvider === true || input.model !== undefined;
     let pickedByDispatch = false;
+    let planLimitMove = false;
     let providerNote: string | undefined;
     if (ownerNamed) {
       const execution = crewExecution({ role: input.role, providerId: input.providerNamed === true || input.ownerRequestedProvider === true ? input.providerId : undefined, model: input.model, modelPermission: input.modelPermission });
@@ -7168,11 +7169,11 @@ export default async function plugin(bb: BbPluginApi) {
       const shipGuard = input.shape === "ship" && (await settings.get()).shipAntigravityGuard !== false;
       const host = await resolveHostForProject(input.projectId, input.parentThreadId, input.signal).catch(() => undefined);
       const owned = input;
-      const pick = await chooseProfile({
+      const pickWith = (planLimits: boolean) => chooseProfile({
         config: loaded.config, rule: input.rule, role: input.role, reasoningLevel: input.reasoningLevel, modelPermission: input.modelPermission, avoidModel, quota,
         check: async (profile) => {
           if (shipGuard && profile.harness === GUARDED_SHIP_PROVIDER) return "not used for ship work";
-          const mark = marks[profile.harness];
+          const mark = planLimits ? marks[profile.harness] : undefined;
           if (mark !== undefined) return `${mark.reason} until ${utcMinute(mark.until)}`;
           try {
             await validateProviderChoice(profile.harness, profile.model, owned.projectId, owned.parentThreadId, toReasoningLevel(profile.effort), host);
@@ -7182,6 +7183,14 @@ export default async function plugin(bb: BbPluginApi) {
             return typeof why === "string" && why !== "unchecked" ? why : null;
           }
         },
+      });
+      // Every listed model refused and one is at its plan limit: that crew moves to the next usable
+      // provider with its own note, as an unnamed dispatch did before model rules.
+      const pick = await pickWith(true).catch(async (error: unknown) => {
+        if (Object.keys(marks).length === 0) throw error;
+        const marked = await pickWith(false).catch(() => { throw error; });
+        planLimitMove = true;
+        return marked;
       });
       pickedByDispatch = true;
       providerNote = [pick.line, pick.notice, loaded.brokenNotice].filter((part) => part !== undefined && part !== "").join("\n");
@@ -7194,7 +7203,7 @@ export default async function plugin(bb: BbPluginApi) {
       input = { ...input, providerId: fallback !== "" && fallback !== GUARDED_SHIP_PROVIDER ? fallback : undefined, model: undefined, providerNamed: false };
     }
     const providerNamed = input.providerNamed === true || input.ownerRequestedProvider === true;
-    if (!providerNamed && !pickedByDispatch) {
+    if (!providerNamed && (!pickedByDispatch || planLimitMove)) {
       const skip = await skipUnavailableProvider(input).catch((error) => { bb.log.warn(`provider availability check: ${String(error)}`); return null; });
       if (skip !== null) {
         input = { ...input, providerId: skip.providerId, model: skip.model ?? undefined, reasoningLevel: skip.reasoningLevel ?? input.reasoningLevel };
