@@ -73,11 +73,15 @@ type World = {
   reports: number;
   reported: Set<string>;
   unsavedChecks: number;
+  /** BB's archive tree: children, hidden source threads and lifecycle dependents of each thread. */
+  descendants: Record<string, string[]>;
+  unarchived: string[];
+  undone: string[];
 };
 
 function world(over: Partial<World> = {}): World {
   const threads: Record<string, CleanupThread> = { thr_cap: { id: "thr_cap", status: "idle", archivedAt: null } };
-  return { tasks: [], crews: [], threads, envs: {}, occupants: {}, dirty: {}, captains: new Set(["thr_cap"]), archived: [], keptNotes: [], reports: 0, reported: new Set(), unsavedChecks: 0, ...over };
+  return { tasks: [], crews: [], threads, envs: {}, occupants: {}, dirty: {}, captains: new Set(["thr_cap"]), archived: [], keptNotes: [], reports: 0, reported: new Set(), unsavedChecks: 0, descendants: {}, unarchived: [], undone: [], ...over };
 }
 
 function putCrew(w: World, crewId: string, threadId: string, envId = "env_1", extra: Partial<CleanupCrew & CleanupThread> = {}) {
@@ -107,11 +111,24 @@ async function run(w: World, extra: Partial<CleanupDeps> = {}) {
     },
     occupants: async (id) => w.occupants[id] ?? [],
     unsaved: async (path) => { w.unsavedChecks += 1; return path in w.dirty ? w.dirty[path]! : []; },
+    descendants: async (id) => (w.descendants[id] ?? []).length,
+    // Like BB: the thread and its whole tree.
     archive: async (id) => {
-      w.archived.push(id);
-      const row = w.threads[id];
-      if (row) row.archivedAt = 1;
+      const tree = (root: string): string[] => [root, ...(w.descendants[root] ?? []).flatMap(tree)];
+      const taken = tree(id).filter((tid) => w.threads[tid]?.archivedAt == null);
+      for (const tid of taken) {
+        w.archived.push(tid);
+        const row = w.threads[tid];
+        if (row) row.archivedAt = 1;
+      }
+      return taken;
     },
+    unarchive: async (id) => {
+      w.unarchived.push(id);
+      const row = w.threads[id];
+      if (row) row.archivedAt = null;
+    },
+    undone: (id, detail) => { w.undone.push(`${id}: ${detail}`); },
     recordKept: (taskId, note) => { w.keptNotes.push(`${taskId}:${note ?? "cleared"}`); },
     alreadyReported: async (taskId) => w.reported.has(taskId),
     reportKept: async (taskId) => { w.reports += 1; w.reported.add(taskId); return true; },
@@ -329,4 +346,133 @@ test("the moment a task finishes, only that task is cleaned; a task whose crews 
   const out = await run(w, { maxTasks: 1, cursor: 0 });
   assert.deepEqual(w.archived, ["thr_b", "thr_a"], "T1 has no crew left, so T2 is first");
   assert.equal(out.nextCursor, 1);
+});
+
+// Check round 1 (PR #179), finding 2: BB archives a thread's whole tree.
+test("a crew with any child, hidden source or lifecycle thread is kept, and so is its child", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  w.threads["thr_child"] = { id: "thr_child", status: "active", environmentId: "env_unsaved", archivedAt: null, parentThreadId: "thr_c1" };
+  w.descendants["thr_c1"] = ["thr_child"];
+  const out = await run(w);
+  assert.deepEqual(w.archived, []);
+  assert.equal(out.rows[0]?.detail, "has child threads");
+  assert.equal(w.unsavedChecks, 0, "no worktree check for a crew that cannot be archived");
+
+  const unknown = world();
+  unknown.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(unknown, "c1", "thr_c1");
+  await run(unknown, { descendants: async () => null });
+  assert.deepEqual(unknown.archived, []);
+});
+
+test("a thread BB archived with the crew after the checks undoes the whole archive, owner first", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  w.threads["thr_dep"] = { id: "thr_dep", status: "idle", archivedAt: null };
+  let checks = 0;
+  // A lifecycle dependent appears after the last check.
+  const out = await run(w, { descendants: async () => { if (++checks === 2) w.descendants["thr_c1"] = ["thr_dep"]; return 0; } });
+  assert.deepEqual(w.archived, ["thr_c1", "thr_dep"]);
+  assert.deepEqual(w.unarchived, ["thr_c1", "thr_dep"]);
+  assert.equal(w.threads["thr_c1"]!.archivedAt, null);
+  assert.equal(w.threads["thr_dep"]!.archivedAt, null);
+  assert.equal(out.rows[0]?.action, "kept");
+  assert.match(out.rows[0]?.detail ?? "", /BB also archived thr_dep; archive undone/);
+});
+
+// Finding 1: BB's archive has no idle precondition.
+test("work that starts between the last read and the archive survives: the archive is undone", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  const out = await run(w, {
+    archive: async (id) => {
+      w.threads[id]!.status = "active";
+      w.threads[id]!.archivedAt = 1;
+      w.archived.push(id);
+      return [id];
+    },
+  });
+  assert.deepEqual(w.unarchived, ["thr_c1"]);
+  assert.equal(w.threads["thr_c1"]!.archivedAt, null);
+  assert.equal(w.threads["thr_c1"]!.status, "active", "the turn keeps running");
+  assert.equal(out.rows[0]?.action, "kept");
+  assert.match(out.rows[0]?.detail ?? "", /work started while archiving; archive undone/);
+  assert.deepEqual(w.undone, ["thr_c1: work started while archiving; archive undone"]);
+});
+
+test("background work in the worktree seen right after the archive undoes it", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  const out = await run(w, {
+    archive: async (id) => {
+      w.occupants["env_1"] = [{ id, status: "idle", busy: true, archivedAt: 1 }];
+      w.threads[id]!.archivedAt = 1;
+      return [id];
+    },
+  });
+  assert.deepEqual(w.unarchived, ["thr_c1"]);
+  assert.equal(out.rows[0]?.action, "kept");
+});
+
+test("an archive call that fails or times out is undone, since it may have reached BB", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  const out = await run(w, { archive: async () => { throw new Error("Timed out."); } });
+  assert.deepEqual(w.unarchived, ["thr_c1"]);
+  assert.match(out.rows[0]?.detail ?? "", /archive failed \(Timed out\.\); archive undone/);
+});
+
+// Finding 3: the worktree check takes time; everything is read again after it.
+test("the task reopening during the worktree check keeps the crew", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  let now: OwnerTask[] = w.tasks;
+  const out = await run(w, {
+    tasksNow: () => now,
+    unsaved: async () => { now = [task({ id: "T1", state: "working" })]; return []; },
+  });
+  assert.deepEqual(w.archived, []);
+  assert.equal(out.rows[0]?.detail, "task reopened");
+});
+
+test("a crew that moved to another worktree during the check is kept", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(w, "c1", "thr_c1");
+  const out = await run(w, { unsaved: async () => { w.threads["thr_c1"]!.environmentId = "env_other"; return []; } });
+  assert.deepEqual(w.archived, []);
+  assert.equal(out.rows[0]?.detail, "environment changed");
+});
+
+test("the worktree check and the archive run under the crews' lock, and the captain is told after it", async () => {
+  const w = world();
+  w.tasks = [task({ id: "T1", state: "live", crewIds: ["b", "a"] })];
+  putCrew(w, "b", "thr_b");
+  putCrew(w, "a", "thr_a");
+  const events: string[] = [];
+  let held = false;
+  await run(w, {
+    locked: async (ids, operation) => { events.push(`lock ${ids.join(",")}`); held = true; try { return await operation(); } finally { held = false; events.push("unlock"); } },
+    unsaved: async () => { events.push(`check held=${held}`); return []; },
+    archive: async (id) => { events.push(`archive ${id} held=${held}`); w.threads[id]!.archivedAt = 1; return [id]; },
+  });
+  assert.deepEqual(events, ["lock b,a", "check held=true", "check held=true", "archive thr_b held=true", "archive thr_a held=true", "unlock"]);
+
+  const dirty = world();
+  dirty.tasks = [task({ id: "T1", state: "live" })];
+  putCrew(dirty, "c1", "thr_c1");
+  dirty.dirty["/wt/env_1"] = ["1 uncommitted file(s)"];
+  let heldAtReport = true;
+  await run(dirty, {
+    locked: async (_ids, operation) => { held = true; try { return await operation(); } finally { held = false; } },
+    reportKept: async () => { heldAtReport = held; return true; },
+  });
+  assert.equal(heldAtReport, false, "telling the captain may take the captain's wake lock, which comes before a crew lock");
 });

@@ -11896,8 +11896,13 @@ export default async function plugin(bb: BbPluginApi) {
   // (lib/task-worktree-cleanup.ts). One pass per captain at a time: the schedule and the moment a task
   // becomes Live or dropped share it, so a kept worktree is reported once.
   const worktreeCleanupRuns = new Map<string, Promise<void>>();
+  // Threads this cleanup is archiving. Their "thread archived" effects wait for its verdict: a
+  // verified archive gets them, an undone archive (work started meanwhile) never does.
+  const cleanupArchiving = new Set<string>();
+  const loggedUndos = new Set<string>();
   function cleanupCaptainWorktrees(captain: string, only?: string): Promise<void> {
-    const run = (worktreeCleanupRuns.get(captain) ?? Promise.resolve()).catch(() => {}).then(() => worktreeCleanupPass(captain, only));
+    // Outside the caller's lock context: a caller that holds a crew's lock must not let this pass skip it.
+    const run = (worktreeCleanupRuns.get(captain) ?? Promise.resolve()).catch(() => {}).then(() => heldLedgers.exit(() => worktreeCleanupPass(captain, only)));
     worktreeCleanupRuns.set(captain, run);
     void run.finally(() => { if (worktreeCleanupRuns.get(captain) === run) worktreeCleanupRuns.delete(captain); }).catch(() => {});
     return run;
@@ -11913,6 +11918,31 @@ export default async function plugin(bb: BbPluginApi) {
       return ["activeBackgroundAgentCount", "activeBackgroundCommandCount", "activeWorkflowCount"].some((key) => Number(activity[key] ?? 0) > 0);
     };
     const archivedAt = (row: Record<string, unknown>) => typeof row["archivedAt"] === "number" ? row["archivedAt"] : row["archivedAt"] == null ? null : Number(row["archivedAt"]);
+    const listRows = async (args: Parameters<typeof bb.sdk.threads.list>[0]) => {
+      const listed = await raceAbort(bb.sdk.threads.list(args), signal, STUCK_HOST_CALL_MS);
+      const rows: unknown[] = Array.isArray(listed) ? listed : Array.isArray(asRecord(listed)["threads"]) ? asRecord(listed)["threads"] as unknown[] : [];
+      return rows.map(asRecord);
+    };
+    // Lifecycle dependents have no list filter: one listing of the project per pass, read when first needed.
+    const lifecycleOwners = new Map<string, Promise<Map<string, number>>>();
+    const dependentsIn = (projectId: string) => {
+      let owners = lifecycleOwners.get(projectId);
+      if (owners === undefined) {
+        owners = listRows({ projectId, includeHidden: true }).then((rows) => {
+          const counts = new Map<string, number>();
+          for (const row of rows) {
+            const owner = row["lifecycleOwnerThreadId"];
+            if (typeof owner === "string" && owner !== "") counts.set(owner, (counts.get(owner) ?? 0) + 1);
+          }
+          return counts;
+        });
+        owners.catch(() => lifecycleOwners.delete(projectId));
+        lifecycleOwners.set(projectId, owners);
+      }
+      return owners;
+    };
+    const archivedThisPass: string[] = [];
+    const verifiedThisPass = new Set<string>();
     try {
       const cursorKey = `task-worktree-cleanup-cursor:${captain}`;
       const stored = only === undefined ? await raceAbort(bb.storage.kv.get<number>(cursorKey), signal, STUCK_HOST_CALL_MS) : 0;
@@ -11922,6 +11952,7 @@ export default async function plugin(bb: BbPluginApi) {
       const { nextCursor } = await runTaskWorktreeCleanup({
         signal,
         tasks: ownerTasks.list(captain, { includeClosed: true }),
+        tasksNow: () => ownerTasks.list(captain, { includeClosed: true }),
         workstreamTaskIds,
         crews: crews.map((crew) => ({
           id: crew.id, threadId: crew.threadId, parentThreadId: crew.parentThreadId, worktree: crew.worktree,
@@ -11946,10 +11977,8 @@ export default async function plugin(bb: BbPluginApi) {
           return { id, isWorktree: env["isWorktree"] === true, ...(typeof env["path"] === "string" ? { path: env["path"] } : {}) };
         },
         occupants: async (environmentId) => {
-          const listed = await raceAbort(bb.sdk.threads.list({ environmentId, includeHidden: true }), signal, STUCK_HOST_CALL_MS);
-          const rows: unknown[] = Array.isArray(listed) ? listed : Array.isArray(asRecord(listed)["threads"]) ? asRecord(listed)["threads"] as unknown[] : [];
-          return rows.map((row) => {
-            const rec = asRecord(row);
+          const rows = await listRows({ environmentId, includeHidden: true });
+          return rows.map((rec) => {
             return {
               id: typeof rec["id"] === "string" ? rec["id"] : "",
               status: typeof rec["status"] === "string" ? rec["status"] : "unknown",
@@ -11965,8 +11994,37 @@ export default async function plugin(bb: BbPluginApi) {
           const found = await unsavedWork(crew, signal);
           return found === null ? [] : found.findings;
         },
+        // BB archives the thread's whole tree: children, hidden source threads, lifecycle dependents.
+        descendants: async (threadId) => {
+          const children = await listRows({ parentThreadId: threadId, includeHidden: true });
+          const sourced = (await listRows({ sourceThreadId: threadId, includeHidden: true })).filter((row) => row["visibility"] !== "visible");
+          const projectId = crews.find((crew) => crew.threadId === threadId)?.projectId;
+          if (!projectId) return null;
+          const dependents = (await raceAbort(dependentsIn(projectId), signal, STUCK_HOST_CALL_MS)).get(threadId) ?? 0;
+          return children.length + sourced.length + dependents;
+        },
         // The thread was read idle just before this. Stopping it here could end a turn that started since.
-        archive: async (threadId) => { await raceAbort(bb.sdk.threads.archive({ threadId }), signal, STUCK_HOST_CALL_MS); },
+        archive: async (threadId) => {
+          cleanupArchiving.add(threadId);
+          archivedThisPass.push(threadId);
+          const result = asRecord(await raceAbort(bb.sdk.threads.archive({ threadId }), signal, STUCK_HOST_CALL_MS));
+          const ids = result["archivedThreadIds"];
+          return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [threadId];
+        },
+        // Not cut short by a reload: an archive that could not be verified must still be undone. Bounded by the timebox.
+        unarchive: async (threadId) => { await raceAbort(bb.sdk.threads.unarchive({ threadId }), undefined, STUCK_HOST_CALL_MS); },
+        verified: (threadId) => { verifiedThisPass.add(threadId); },
+        undone: (threadId, detail) => {
+          if (detail.includes("undo failed")) bb.log.warn(`task worktree cleanup: ${threadId}: ${detail}`);
+          else if (!loggedUndos.has(threadId)) { loggedUndos.add(threadId); bb.log.warn(`task worktree cleanup: ${threadId}: ${detail}; worktree kept`); }
+        },
+        // Firstmate's crew lock, taken in crew id order when one worktree holds several of the task's crews.
+        locked: <T>(crewIds: readonly string[], operation: () => Promise<T>): Promise<T> => {
+          const ids = [...crewIds].sort();
+          const step = (i: number): Promise<T> => i === ids.length ? operation() : retireCrew(ids[i]!, () => step(i + 1));
+          // A crew lock held by a long restart must not pin the pass through a reload; the queued step sees the abort and does nothing.
+          return raceAbort(step(0), signal);
+        },
         recordKept: (taskId, note) => {
           try { ownerTasks.keepWorktree(taskId, captain, note); }
           catch (error) { bb.log.warn(`task worktree kept ${taskId}: ${error instanceof Error ? error.message : String(error)}`); }
@@ -12002,6 +12060,10 @@ export default async function plugin(bb: BbPluginApi) {
       throw error;
     } finally {
       clearTimeout(timer);
+      for (const threadId of archivedThisPass) {
+        cleanupArchiving.delete(threadId);
+        if (verifiedThisPass.has(threadId)) await threadArchivedEffects(threadId).catch((error) => bb.log.warn(`thread archived ${threadId}: ${String(error)}`));
+      }
     }
   }
 
@@ -19878,10 +19940,15 @@ export default async function plugin(bb: BbPluginApi) {
     })();
     try { await taskWorktreeCleanupWork; } finally { taskWorktreeCleanupWork = undefined; }
   });
-  bb.events.on("thread.archived", async ({ thread }) => {
-    deliveries.ownerLost(thread.id);
-    const crew = await findCrewByThread(thread.id);
+  async function threadArchivedEffects(threadId: string): Promise<void> {
+    deliveries.ownerLost(threadId);
+    const crew = await findCrewByThread(threadId);
     if (crew !== undefined) inboundLedger.crewEnded(crew.id, Date.now());
+  }
+  bb.events.on("thread.archived", async ({ thread }) => {
+    // The worktree cleanup applies these itself once its archive is verified, and never after an undo.
+    if (cleanupArchiving.has(thread.id)) return;
+    await threadArchivedEffects(thread.id);
   });
   bb.events.on("thread.deleted", ({ thread }) => { launches.workerDeleted(thread.id); deliveries.ownerLost(thread.id); });
 
