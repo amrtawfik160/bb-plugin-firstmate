@@ -1,0 +1,7 @@
+#!/bin/sh
+# Tests must never reach the real BB CLI (a real `bb connect expose` publishes a port). npm test
+# puts this first on PATH, so a test that runs a real `bb` fails here; test/no-live-bb.mjs keeps a
+# test's bash from reading a ~/.bashrc that puts the real bb back in front.
+echo "live bb call blocked in tests: bb $*" >&2
+[ -z "${FM_LIVE_BB_LOG:-}" ] || echo "bb $*" >> "$FM_LIVE_BB_LOG"
+exit 97

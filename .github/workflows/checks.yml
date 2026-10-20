@@ -71,4 +71,4 @@ jobs:
           sudo git config --system --add safe.directory '*'
           sudo env "PATH=$PATH" HOME=/root \
             FIRSTMATE_TEST_NATIVE="$FIRSTMATE_TEST_NATIVE" FM_TEST_HOME="$FM_TEST_HOME" FM_CLASSIFY_LIB="$FM_CLASSIFY_LIB" \
-            node --test --experimental-strip-types --import ./test/temp-cleanup.mjs --test-global-setup=./test/temp-guard.mjs $files
+            node --test --experimental-strip-types --import ./test/temp-cleanup.mjs --import ./test/no-live-bb.mjs --test-global-setup=./test/temp-guard.mjs $files

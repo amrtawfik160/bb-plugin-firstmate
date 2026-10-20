@@ -96,3 +96,19 @@ archive hash remains
 
 No real model worker, production fleet operation, PR operation or plugin reload
 was performed. Parent's independent runtime acceptance remains parent-owned.
+
+## Every test process (20 Oct)
+
+The same escape reached two more fixtures in a full run started inside `( … )`. Bash runs the
+last command of a subshell directly and lowers `SHLVL` by one, so the whole run started at
+`SHLVL=0`. The dev-link test in `lib/workstream-runtime.test.ts` then ran a real
+`bb connect expose 5200`, and the approval test in `lib/crew-contract.test.ts` reached the
+real `gh`, which refused unauthenticated.
+
+Fixing one fixture at a time left the rest exposed, so every test process now loads
+`test/no-live-bb.mjs`. It raises a missing or zero `SHLVL` to 1, so a child `bash -c` is
+level 2 and never reads `~/.bashrc`, and it drops `BB_CLI`. `npm test` also puts the
+blocking stand-in `test/no-live-bb/bb` (exit 97, optional `FM_LIVE_BB_LOG`) after the `gh`
+one on `PATH`, and unsets `BB_CLI`. The dev-link test checks that its shell resolves its
+own fake `bb` before the script runs. `scripts/no-live-bb.test.mjs` reproduces the escape
+with a decoy `bb` in a throwaway `HOME` and proves the guard.
