@@ -563,6 +563,14 @@ function wrapHostCommand(command: string): string {
   return script;
 }
 
+// A gh call whose output Firstmate reads. On the host terminal gh writes a "Working..." progress line to stderr,
+// and the PTY mixes it into the output (Cyndra PR 2581's fold check failed "Unexpected token 'W'" on every read,
+// 2026-10-20). The host's gh wrapper sets GH_FORCE_TTY, so a pipe alone does not stop it: stderr is held in a
+// file and shown only when gh fails, stdout goes through a pipe, and pipefail keeps gh's exit code.
+export function ghReadCommand(command: string): string {
+  return `bash -o pipefail -c ${shQuote(`e=$(mktemp) || exit 1; { ${command}; } 2>"$e" | cat; rc=$?; [ "$rc" -eq 0 ] || cat "$e" >&2; rm -f "$e"; exit "$rc"`)}`;
+}
+
 /** fetch for the read-only live checks. The test run sets FM_NO_LIVE_NETWORK=1, so no test reaches Expo or Coolify. */
 function liveFetch(url: string, init: { method?: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }) {
   if (process.env["FM_NO_LIVE_NETWORK"] === "1") return Promise.reject(new Error("live network is off in tests (FM_NO_LIVE_NETWORK=1)"));
@@ -3009,7 +3017,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function prHeadBranch(url: string | undefined, hostId: string): Promise<string | undefined> {
     if (!url) return undefined;
     try {
-      const view = asRecord(JSON.parse(await workstreamCommand({ hostId }, `gh pr view ${shQuote(url)} --json headRefName`, 60_000)));
+      const view = asRecord(JSON.parse(await workstreamCommand({ hostId }, ghReadCommand(`gh pr view ${shQuote(url)} --json headRefName`), 60_000)));
       return typeof view["headRefName"] === "string" && view["headRefName"] ? view["headRefName"] : undefined;
     } catch { return undefined; }
   }
@@ -3290,7 +3298,7 @@ export default async function plugin(bb: BbPluginApi) {
         head = await workstreamCommand(repo,prefix + 'git rev-parse HEAD');
       }
       const rows = z.array(z.object({url:z.string(),state:z.string(),headRefOid:z.string()})).parse(JSON.parse(await workstreamCommand(repo,
-        prefix + `gh pr list --head ${shQuote(repo.branch)} --base ${shQuote(base)} --state all --limit 100 --json url,state,headRefOid`)));
+        ghReadCommand(prefix + `gh pr list --head ${shQuote(repo.branch)} --base ${shQuote(base)} --state all --limit 100 --json url,state,headRefOid`))));
       let pr = rows.find((r) => r.state === "OPEN");
       if (!pr) {
         await workstreamCommand(repo,prefix + `git fetch origin ${shQuote(base)} >/dev/null`);
@@ -3303,7 +3311,7 @@ export default async function plugin(bb: BbPluginApi) {
         const body = `## Summary\n\n\`\`\`text\nWorkstream ${w.id}\n  Ship -> independent checker -> merge -> project live check\n\`\`\`\n\n## Evidence\n\n- **Before:** Workstream commits await their checker.\n  **After:** The checker records proof at the current head before merge.\n\n## Merge Danger\n\n**Door:** two-way\n\n**Blast Radius:** project\n`;
         const bodyPath = `/tmp/firstmate-${w.id}-pr.md`;
         await workstreamCommand(repo, `umask 077; printf %s ${shQuote(body)} > ${shQuote(bodyPath)}`);
-        const url = await workstreamCommand(repo,prefix + `gh pr create --base ${shQuote(base)} --head ${shQuote(repo.branch)} --title ${shQuote(w.name)} --body-file ${shQuote(bodyPath)}`);
+        const url = await workstreamCommand(repo,ghReadCommand(prefix + `gh pr create --base ${shQuote(base)} --head ${shQuote(repo.branch)} --title ${shQuote(w.name)} --body-file ${shQuote(bodyPath)}`));
         pr = {url,state:"OPEN",headRefOid:head};
       }
       if (snapshot) await closeReplacedPrs(w, repo, pr.url, head);
@@ -3370,7 +3378,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (entry.state !== "open" || entry.repository.toLowerCase() !== repo.repository.toLowerCase()) continue;
       try {
         const view = z.object({ state: z.string(), commits: z.array(z.object({ oid: z.string() })) })
-          .parse(JSON.parse(await workstreamCommand(repo, prefix + `gh pr view ${shQuote(entry.url)} --json state,commits`)));
+          .parse(JSON.parse(await workstreamCommand(repo, ghReadCommand(prefix + `gh pr view ${shQuote(entry.url)} --json state,commits`))));
         const commits = view.commits.map((c) => c.oid);
         const contained = commits.length === 0 ? new Set<string>() : parseContained(await workstreamCommand(repo, `bash -c ${shQuote(prContainsScript(repo.path, head, commits))}`));
         const verdict = replacedPrVerdict({ state: view.state, commits }, contained);
@@ -3392,12 +3400,12 @@ export default async function plugin(bb: BbPluginApi) {
   async function foldedTaskPr(w: Workstream, repo: WorkstreamRepo, job: WorkstreamJob, url: string): Promise<{ dispose: string } | { keep: string }> {
     const prefix = `cd -- ${shQuote(repo.path)} && `;
     const view = z.object({ state: z.string(), headRefName: z.string(), headRefOid: z.string(), commits: z.array(z.object({ oid: z.string() })) })
-      .parse(JSON.parse(await workstreamCommand(repo, prefix + `gh pr view ${shQuote(url)} --json state,headRefName,headRefOid,commits`)));
+      .parse(JSON.parse(await workstreamCommand(repo, ghReadCommand(prefix + `gh pr view ${shQuote(url)} --json state,headRefName,headRefOid,commits`))));
     const commits = view.commits.map((c) => c.oid);
     const contained = commits.length === 0 ? new Set<string>() : parseContained(await workstreamCommand(repo, `bash -c ${shQuote(prContainsScript(repo.path, `refs/heads/${repo.branch}`, [...new Set([...commits, view.headRefOid])]))}`));
     const verdict = foldedPrVerdict({ ...view, commits }, jobCheckouts(job).map((c) => c.branch), contained);
     if (verdict.action === "keep") return { keep: verdict.reason };
-    const workstreamPr = z.array(z.object({ url: z.string() })).parse(JSON.parse(await workstreamCommand(repo, prefix + `gh pr list --head ${shQuote(repo.branch)} --state open --json url --limit 1`)));
+    const workstreamPr = z.array(z.object({ url: z.string() })).parse(JSON.parse(await workstreamCommand(repo, ghReadCommand(prefix + `gh pr list --head ${shQuote(repo.branch)} --state open --json url --limit 1`))));
     return { dispose: foldedPrNote(w.name, workstreamPr[0]?.url ?? null) };
   }
 
@@ -3406,7 +3414,7 @@ export default async function plugin(bb: BbPluginApi) {
   // reason is returned.
   async function closeFoldedPrs(w: Workstream, repo: WorkstreamRepo, job: WorkstreamJob, branch: string): Promise<string | null> {
     const prefix = `cd -- ${shQuote(repo.path)} && `;
-    const open = z.array(z.object({ url: z.string() })).parse(JSON.parse(await workstreamCommand(repo, prefix + `gh pr list --head ${shQuote(branch)} --state open --json url`)));
+    const open = z.array(z.object({ url: z.string() })).parse(JSON.parse(await workstreamCommand(repo, ghReadCommand(prefix + `gh pr list --head ${shQuote(branch)} --state open --json url`))));
     const closing: Array<{ url: string; note: string }> = [];
     for (const pr of open) {
       const check = await foldedTaskPr(w, repo, job, pr.url);

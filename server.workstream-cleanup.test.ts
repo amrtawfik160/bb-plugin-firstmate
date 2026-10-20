@@ -68,7 +68,7 @@ async function foldedTask() {
     commands.push(command);
     if (command.includes('echo present')) return { exitCode: 0, stdout: 'present' };
     if (command.includes(' check ')) { duringCheck(); return { exitCode: 0, stdout: unsaved }; }
-    const head = /gh pr list --head '([^']+)'/.exec(command)?.[1];
+    const head = /gh pr list --head (?:'\\'')?'?([^'\\]+)/.exec(command)?.[1]; // plain or nested in ghReadCommand's quotes
     if (head) return { exitCode: 0, stdout: JSON.stringify((gh.open.get(head) ?? []).map((url) => ({ url }))) };
     if (command.includes('gh pr view')) return { exitCode: 0, stdout: JSON.stringify(gh.pr) };
     if (command.includes('merge-base --is-ancestor')) {
